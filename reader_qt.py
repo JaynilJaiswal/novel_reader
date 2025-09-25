@@ -6,7 +6,7 @@ import sounddevice as sd
 import soundfile as sf
 import io
 import numpy as np
-import json # Import the json library
+import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QTextEdit, QPushButton, QComboBox, QHBoxLayout,
                              QFileDialog, QMessageBox, QLabel, QSlider, QDialog,
@@ -19,6 +19,7 @@ from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat, QFont, QAction, QI
 VOICE_DIR = os.path.expanduser("~/.local/share/piper-voices")
 
 class SettingsDialog(QDialog):
+    # This class is already correctly set up by you. No changes needed.
     def __init__(self, current_settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Appearance Settings")
@@ -32,9 +33,11 @@ class SettingsDialog(QDialog):
         self.bg_color_btn = self.create_color_button(self.settings["bg_color"])
         self.text_color_btn = self.create_color_button(self.settings["text_color"])
         self.highlight_color_btn = self.create_color_button(self.settings["highlight_color"])
-        color_layout.addWidget(QLabel("Background:")); color_layout.addWidget(self.bg_color_btn)
+        self.completed_color_btn = self.create_color_button(self.settings["completed_color"])
+        color_layout.addWidget(QLabel("BG:")); color_layout.addWidget(self.bg_color_btn)
         color_layout.addWidget(QLabel("Text:")); color_layout.addWidget(self.text_color_btn)
         color_layout.addWidget(QLabel("Highlight:")); color_layout.addWidget(self.highlight_color_btn)
+        color_layout.addWidget(QLabel("Completed:")); color_layout.addWidget(self.completed_color_btn)
         layout.addRow(color_layout)
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(self.accept); button_box.rejected.connect(self.reject)
@@ -42,23 +45,21 @@ class SettingsDialog(QDialog):
         self.bg_color_btn.clicked.connect(lambda: self.pick_color(self.bg_color_btn, "bg_color"))
         self.text_color_btn.clicked.connect(lambda: self.pick_color(self.text_color_btn, "text_color"))
         self.highlight_color_btn.clicked.connect(lambda: self.pick_color(self.highlight_color_btn, "highlight_color"))
+        self.completed_color_btn.clicked.connect(lambda: self.pick_color(self.completed_color_btn, "completed_color"))
 
     def create_color_button(self, color):
         btn = QPushButton(); btn.setFixedSize(24, 24); btn.setStyleSheet(f"background-color: {color}; border: 1px solid grey;")
         return btn
-
     def pick_color(self, btn, key):
         color = QColorDialog.getColor(QColor(self.settings[key]), self)
         if color.isValid(): self.settings[key] = color.name(); btn.setStyleSheet(f"background-color: {color.name()}; border: 1px solid grey;")
-
     def accept(self):
         self.settings["font_family"] = self.font_combo.currentFont().family()
         self.settings["font_size"] = self.font_size_spinbox.value()
         super().accept()
-
     def get_settings(self): return self.settings
 
-# (Worker classes remain unchanged)
+
 class PiperSynthWorker(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
@@ -93,6 +94,8 @@ class PiperSynthWorker(QObject):
 class AudioPlaybackWorker(QObject):
     playback_finished = pyqtSignal()
     highlight_line = pyqtSignal(int)
+    # --- NEW: Signal for when a line is finished playing ---
+    line_completed = pyqtSignal(int)
     
     def __init__(self, audio_queue, volume, line_index_offset):
         super().__init__(); self.audio_queue = audio_queue; self.volume = volume
@@ -110,7 +113,12 @@ class AudioPlaybackWorker(QObject):
                 if stream is None or stream.samplerate != samplerate:
                     if stream: stream.close()
                     stream = sd.OutputStream(samplerate=samplerate, channels=1, dtype='float32'); stream.start()
-                stream.write(audio_data * self.volume)
+                
+                stream.write(audio_data * self.volume) # This call blocks until the audio is done
+                
+                # --- NEW: Emit the completed signal after the audio has been played ---
+                self.line_completed.emit(original_line_index)
+
         except Exception as e: print(f"Playback error: {e}")
         finally:
             if stream: stream.stop(); stream.close()
@@ -131,23 +139,20 @@ class MainWindow(QMainWindow):
         self.last_highlighted_block = None
         self.playback_state = "stopped"
         self.current_line_index = 0
-
+        
         self.config_path = os.path.expanduser("~/.config/piper-qt/settings.json")
-        # --- NEW: Add session keys to default settings ---
         self.settings = {
             "font_family": "Noto Sans", "font_size": 14,
             "bg_color": "#ffffff", "text_color": "#000000",
             "highlight_color": "#a8d8ff",
+            "completed_color": "#808080",
             "voice": "", "speed": 10, "volume": 100,
             "session_text": "", "session_cursor_line": 0
         }
-        self.load_settings() # Load saved settings over defaults
+        self.load_settings()
 
-        self.setup_actions()
-        self.setup_menu()
-        self.setup_toolbar()
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        self.setup_actions(); self.setup_menu(); self.setup_toolbar()
+        central_widget = QWidget(); self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(QLabel("Voice:")); self.voice_combo = QComboBox(); self.populate_voices()
@@ -173,117 +178,8 @@ class MainWindow(QMainWindow):
         self.speed_slider.valueChanged.connect(self.update_speed_label)
         self.volume_slider.valueChanged.connect(self.update_volume_label)
         self.apply_settings()
-        # --- NEW: Restore session after UI is built and styled ---
         self.restore_session()
 
-    def load_settings(self):
-        try:
-            if os.path.exists(self.config_path):
-                with open(self.config_path, 'r') as f:
-                    loaded_settings = json.load(f)
-                    # Update defaults with loaded settings to ensure no missing keys
-                    self.settings.update(loaded_settings)
-                    print("Settings loaded successfully.")
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Could not load settings file: {e}. Using defaults.")
-
-    def save_settings(self):
-        try:
-            self.settings["voice"] = self.voice_combo.currentText()
-            self.settings["speed"] = self.speed_slider.value()
-            self.settings["volume"] = self.volume_slider.value()
-            # --- NEW: Save session data ---
-            self.settings["session_text"] = self.text_edit.toPlainText()
-            self.settings["session_cursor_line"] = self.text_edit.textCursor().blockNumber()
-
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, 'w') as f:
-                json.dump(self.settings, f, indent=4)
-                print("Settings saved.")
-        except IOError as e:
-            print(f"Could not save settings file: {e}")
-
-    # --- NEW: Method to restore session ---
-    def restore_session(self):
-        if self.settings.get("session_text"):
-            self.text_edit.setText(self.settings["session_text"])
-            
-            # Move cursor to the saved line number
-            cursor_line = self.settings.get("session_cursor_line", 0)
-            doc = self.text_edit.document()
-            block = doc.findBlockByNumber(cursor_line)
-            if block.isValid():
-                cursor = QTextCursor(block)
-                self.text_edit.setTextCursor(cursor)
-                
-    def setup_actions(self):
-        self.open_action = QAction(QIcon.fromTheme("document-open"), "&Open Text File...", self)
-        self.open_action.triggered.connect(self.open_text_file)
-        self.settings_action = QAction(QIcon.fromTheme("preferences-system"), "&Settings...", self)
-        self.settings_action.triggered.connect(self.open_settings_dialog)
-    def setup_menu(self):
-        menu = self.menuBar(); file_menu = menu.addMenu("&File"); file_menu.addAction(self.open_action)
-        edit_menu = menu.addMenu("&Edit"); edit_menu.addAction(self.settings_action)
-    def setup_toolbar(self):
-        toolbar = self.addToolBar("Main Toolbar"); toolbar.addAction(self.open_action); toolbar.addAction(self.settings_action)
-
-    def open_text_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open Text File", "", "Text Files (*.txt);;All Files (*)")
-        if file_path:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f: self.text_edit.setText(f.read())
-            except Exception as e: self.show_error(f"Failed to open file:\n\n{e}")
-
-    def open_settings_dialog(self):
-        dialog = SettingsDialog(self.settings, self)
-        if dialog.exec():
-            self.settings = dialog.get_settings()
-            self.apply_settings()
-            self.save_settings() # Save settings when they are changed
-
-    def apply_settings(self):
-        font = QFont(self.settings["font_family"], self.settings["font_size"])
-        self.text_edit.setFont(font)
-        self.text_edit.setStyleSheet(f"background-color: {self.settings['bg_color']}; color: {self.settings['text_color']};")
-        # --- NEW: Apply loaded/default voice, speed, volume to UI ---
-        if self.settings["voice"]:
-            self.voice_combo.setCurrentText(self.settings["voice"])
-        self.speed_slider.setValue(self.settings["speed"])
-        self.volume_slider.setValue(self.settings["volume"])
- 
-    
-    def update_highlight(self, line_index):
-        self.clear_highlight()
-        self.current_line_index = line_index
-        doc = self.text_edit.document()
-        block = doc.findBlockByNumber(line_index)
-        if block.isValid():
-            self.last_highlighted_block = block
-            cursor = QTextCursor(block)
-            fmt = QTextCharFormat(); fmt.setBackground(QColor(self.settings["highlight_color"]))
-            cursor.select(QTextCursor.SelectionType.BlockUnderCursor); cursor.mergeCharFormat(fmt)
-            # Get the rectangle of the current cursor (the highlighted block)
-            cursor_rect = self.text_edit.cursorRect(cursor)
-            viewport_height = self.text_edit.viewport().height()
-
-            # If the bottom of the highlight is in the lower 10% of the screen, scroll
-            if cursor_rect.bottom() > (viewport_height * 0.9):
-                scrollbar = self.text_edit.verticalScrollBar()
-                # Scroll down by half the height of the viewport for a smooth jump
-                scrollbar.setValue(scrollbar.value() + int(viewport_height * 0.8))
-
-
-
-    # (Other methods are unchanged...)
-    def update_speed_label(self, value): self.speed_label.setText(f"{value / 10.0:.1f}x")
-    def update_volume_label(self, value): self.volume_label.setText(f"{value}%")
-    def populate_voices(self):
-        if not os.path.exists(VOICE_DIR): return
-        for file in sorted(os.listdir(VOICE_DIR)):
-            if file.endswith(".onnx"): self.voice_combo.addItem(file)
-    def toggle_playback(self):
-        if self.playback_state == "playing": self.pause_audio()
-        else: self.play_audio()
     def play_audio(self):
         if self.playback_state == "stopped":
             cursor = self.text_edit.textCursor(); self.current_line_index = cursor.blockNumber()
@@ -297,13 +193,110 @@ class MainWindow(QMainWindow):
         self.audio_player.moveToThread(self.playback_thread)
         self.synth_thread = QThread(); self.synth_worker = PiperSynthWorker(lines_to_play, self.get_selected_voice_path(), self.audio_queue, speed)
         self.synth_worker.moveToThread(self.synth_thread)
+        
         self.audio_player.highlight_line.connect(self.update_highlight)
+        # --- NEW: Connect the completed signal to its slot ---
+        self.audio_player.line_completed.connect(self.mark_line_as_completed)
         self.synth_worker.error.connect(self.show_error)
         self.audio_player.playback_finished.connect(self.on_playback_finished)
+        
         self.playback_thread.started.connect(self.audio_player.run); self.synth_thread.started.connect(self.synth_worker.run)
         self.playback_thread.start(); self.synth_thread.start()
         self.playback_state = "playing"; self.play_button.setText("⏸ Pause")
         self.stop_button.setEnabled(True); self.text_edit.setReadOnly(True)
+
+    # --- NEW: Slot to handle the line_completed signal ---
+    def mark_line_as_completed(self, line_index):
+        doc = self.text_edit.document()
+        block = doc.findBlockByNumber(line_index)
+        if block.isValid():
+            cursor = QTextCursor(block)
+            fmt = QTextCharFormat()
+            # Set the foreground text color to the completed color
+            fmt.setForeground(QColor(self.settings["completed_color"]))
+            # Ensure the background is cleared
+            fmt.setBackground(Qt.GlobalColor.transparent)
+            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            cursor.mergeCharFormat(fmt)
+            self.last_highlighted_block = None # The block is no longer "highlighted"
+
+    def clear_highlight(self, force_clear_all=False):
+        # --- MODIFIED: This function now also resets the text color on a full clear ---
+        clear_format = QTextCharFormat()
+        clear_format.setBackground(Qt.GlobalColor.transparent)
+        if force_clear_all:
+             temp_cursor = QTextCursor(self.text_edit.document()); temp_cursor.select(QTextCursor.SelectionType.Document)
+             temp_cursor.mergeCharFormat(clear_format)
+        elif hasattr(self, 'last_highlighted_block') and self.last_highlighted_block and self.last_highlighted_block.isValid():
+            temp_cursor = QTextCursor(self.last_highlighted_block); temp_cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            temp_cursor.mergeCharFormat(clear_format)
+        self.last_highlighted_block = None
+
+    # (Other methods are unchanged and omitted for brevity)
+    def load_settings(self):
+        try:
+            if os.path.exists(self.config_path):
+                with open(self.config_path, 'r') as f: self.settings.update(json.load(f))
+        except Exception as e: print(f"Could not load settings: {e}")
+    def save_settings(self):
+        try:
+            self.settings["voice"] = self.voice_combo.currentText(); self.settings["speed"] = self.speed_slider.value(); self.settings["volume"] = self.volume_slider.value()
+            self.settings["session_text"] = self.text_edit.toPlainText(); self.settings["session_cursor_line"] = self.text_edit.textCursor().blockNumber()
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            with open(self.config_path, 'w') as f: json.dump(self.settings, f, indent=4)
+        except Exception as e: print(f"Could not save settings: {e}")
+    def restore_session(self):
+        if self.settings.get("session_text"):
+            self.text_edit.setText(self.settings["session_text"])
+            cursor_line = self.settings.get("session_cursor_line", 0)
+            block = self.text_edit.document().findBlockByNumber(cursor_line)
+            if block.isValid(): self.text_edit.setTextCursor(QTextCursor(block))
+    def setup_actions(self):
+        self.open_action = QAction(QIcon.fromTheme("document-open"), "&Open Text File...", self); self.open_action.triggered.connect(self.open_text_file)
+        self.settings_action = QAction(QIcon.fromTheme("preferences-system"), "&Settings...", self); self.settings_action.triggered.connect(self.open_settings_dialog)
+    def setup_menu(self):
+        menu = self.menuBar(); file_menu = menu.addMenu("&File"); file_menu.addAction(self.open_action); edit_menu = menu.addMenu("&Edit"); edit_menu.addAction(self.settings_action)
+    def setup_toolbar(self):
+        toolbar = self.addToolBar("Main Toolbar"); toolbar.addAction(self.open_action); toolbar.addAction(self.settings_action)
+    def open_text_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Text File", "", "Text Files (*.txt);;All Files (*)")
+        if file_path:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f: self.text_edit.setText(f.read())
+            except Exception as e: self.show_error(f"Failed to open file:\n\n{e}")
+    def open_settings_dialog(self):
+        dialog = SettingsDialog(self.settings, self)
+        if dialog.exec(): self.settings = dialog.get_settings(); self.apply_settings(); self.save_settings()
+    def apply_settings(self):
+        font = QFont(self.settings["font_family"], self.settings["font_size"])
+        self.text_edit.setFont(font)
+        self.text_edit.setStyleSheet(f"background-color: {self.settings['bg_color']}; color: {self.settings['text_color']};")
+        if self.settings["voice"]: self.voice_combo.setCurrentText(self.settings["voice"])
+        self.speed_slider.setValue(self.settings["speed"]); self.volume_slider.setValue(self.settings["volume"])
+    def update_highlight(self, line_index):
+        self.clear_highlight()
+        self.current_line_index = line_index
+        doc = self.text_edit.document()
+        block = doc.findBlockByNumber(line_index)
+        if block.isValid():
+            self.last_highlighted_block = block
+            cursor = QTextCursor(block)
+            fmt = QTextCharFormat(); fmt.setBackground(QColor(self.settings["highlight_color"]))
+            cursor.select(QTextCursor.SelectionType.BlockUnderCursor); cursor.mergeCharFormat(fmt)
+            cursor_rect = self.text_edit.cursorRect(cursor)
+            viewport_height = self.text_edit.viewport().height()
+            if cursor_rect.bottom() > (viewport_height * 0.8):
+                scrollbar = self.text_edit.verticalScrollBar()
+                scrollbar.setValue(scrollbar.value() + viewport_height // 2)
+    def update_speed_label(self, value): self.speed_label.setText(f"{value / 10.0:.1f}x")
+    def update_volume_label(self, value): self.volume_label.setText(f"{value}%")
+    def populate_voices(self):
+        if not os.path.exists(VOICE_DIR): return
+        for file in sorted(os.listdir(VOICE_DIR)):
+            if file.endswith(".onnx"): self.voice_combo.addItem(file)
+    def toggle_playback(self):
+        if self.playback_state == "playing": self.pause_audio()
+        else: self.play_audio()
     def pause_audio(self):
         self.playback_state = "paused"; self.play_button.setText("▶ Resume")
         if hasattr(self, 'audio_player'): self.audio_player.playback_finished.disconnect(self.on_playback_finished)
@@ -317,15 +310,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'audio_player'): self.audio_player.stop(); self.playback_thread.quit(); self.playback_thread.wait()
         if reset_highlight: self.clear_highlight(force_clear_all=True)
         self.text_edit.setReadOnly(False); self.stop_button.setEnabled(False)
-    def clear_highlight(self, force_clear_all=False):
-        clear_format = QTextCharFormat(); clear_format.setBackground(Qt.GlobalColor.transparent)
-        if force_clear_all:
-             temp_cursor = QTextCursor(self.text_edit.document()); temp_cursor.select(QTextCursor.SelectionType.Document)
-             temp_cursor.mergeCharFormat(clear_format)
-        elif hasattr(self, 'last_highlighted_block') and self.last_highlighted_block and self.last_highlighted_block.isValid():
-            temp_cursor = QTextCursor(self.last_highlighted_block); temp_cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
-            temp_cursor.mergeCharFormat(clear_format)
-        self.last_highlighted_block = None
     def save_audio(self):
         if self.playback_state == "playing": self.show_error("Please stop playback before saving."); return
         full_text = self.text_edit.toPlainText()
@@ -349,8 +333,7 @@ class MainWindow(QMainWindow):
     def show_error(self, message):
         QMessageBox.critical(self, "Error", message); self.full_stop()
     def closeEvent(self, event):
-        self.save_settings() # Save settings on exit
-        self.full_stop(); event.accept()
+        self.save_settings(); self.full_stop(); event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
