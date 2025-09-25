@@ -233,6 +233,18 @@ class MainWindow(QMainWindow):
             cursor = QTextCursor(block)
             fmt = QTextCharFormat(); fmt.setBackground(QColor(self.settings["highlight_color"]))
             cursor.select(QTextCursor.SelectionType.BlockUnderCursor); cursor.mergeCharFormat(fmt)
+            # --- NEW: Conditional Auto-scroll logic ---
+            # Get the rectangle of the current cursor (the highlighted block)
+            cursor_rect = self.text_edit.cursorRect(cursor)
+            viewport_height = self.text_edit.viewport().height()
+
+            # If the bottom of the highlight is in the lower 10% of the screen, scroll
+            if cursor_rect.bottom() > (viewport_height * 0.9):
+                scrollbar = self.text_edit.verticalScrollBar()
+                # Scroll down by half the height of the viewport for a smooth jump
+                scrollbar.setValue(scrollbar.value() + int(viewport_height * 0.8))
+
+
 
     # (Other methods are unchanged...)
     def update_speed_label(self, value): self.speed_label.setText(f"{value / 10.0:.1f}x")
