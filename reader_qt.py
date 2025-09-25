@@ -133,14 +133,13 @@ class MainWindow(QMainWindow):
         self.current_line_index = 0
 
         self.config_path = os.path.expanduser("~/.config/piper-qt/settings.json")
-        # --- NEW: Add voice, speed, and volume to default settings ---
+        # --- NEW: Add session keys to default settings ---
         self.settings = {
             "font_family": "Noto Sans", "font_size": 14,
             "bg_color": "#ffffff", "text_color": "#000000",
             "highlight_color": "#a8d8ff",
-            "voice": "",
-            "speed": 10,
-            "volume": 100
+            "voice": "", "speed": 10, "volume": 100,
+            "session_text": "", "session_cursor_line": 0
         }
         self.load_settings() # Load saved settings over defaults
 
@@ -174,8 +173,9 @@ class MainWindow(QMainWindow):
         self.speed_slider.valueChanged.connect(self.update_speed_label)
         self.volume_slider.valueChanged.connect(self.update_volume_label)
         self.apply_settings()
+        # --- NEW: Restore session after UI is built and styled ---
+        self.restore_session()
 
-    # --- NEW: Methods for saving and loading settings ---
     def load_settings(self):
         try:
             if os.path.exists(self.config_path):
@@ -189,10 +189,12 @@ class MainWindow(QMainWindow):
 
     def save_settings(self):
         try:
-            # --- NEW: Update settings from UI before saving ---
             self.settings["voice"] = self.voice_combo.currentText()
             self.settings["speed"] = self.speed_slider.value()
             self.settings["volume"] = self.volume_slider.value()
+            # --- NEW: Save session data ---
+            self.settings["session_text"] = self.text_edit.toPlainText()
+            self.settings["session_cursor_line"] = self.text_edit.textCursor().blockNumber()
 
             os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
             with open(self.config_path, 'w') as f:
@@ -201,6 +203,19 @@ class MainWindow(QMainWindow):
         except IOError as e:
             print(f"Could not save settings file: {e}")
 
+    # --- NEW: Method to restore session ---
+    def restore_session(self):
+        if self.settings.get("session_text"):
+            self.text_edit.setText(self.settings["session_text"])
+            
+            # Move cursor to the saved line number
+            cursor_line = self.settings.get("session_cursor_line", 0)
+            doc = self.text_edit.document()
+            block = doc.findBlockByNumber(cursor_line)
+            if block.isValid():
+                cursor = QTextCursor(block)
+                self.text_edit.setTextCursor(cursor)
+                
     def setup_actions(self):
         self.open_action = QAction(QIcon.fromTheme("document-open"), "&Open Text File...", self)
         self.open_action.triggered.connect(self.open_text_file)
