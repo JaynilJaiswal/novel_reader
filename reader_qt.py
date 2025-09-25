@@ -248,7 +248,7 @@ class MainWindow(QMainWindow):
         if self.playback_state == "stopped":
             cursor = self.text_edit.textCursor(); self.current_line_index = cursor.blockNumber()
             full_text = self.text_edit.toPlainText()
-            self.lines = [line for line in full_text.splitlines() if line.strip()]
+            self.lines = [line for line in full_text.splitlines()]
         lines_to_play = self.lines[self.current_line_index:]
         if not lines_to_play: self.full_stop(); return
         speed = self.speed_slider.value() / 10.0; volume = self.volume_slider.value() / 100.0
