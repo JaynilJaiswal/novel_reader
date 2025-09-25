@@ -132,12 +132,15 @@ class MainWindow(QMainWindow):
         self.playback_state = "stopped"
         self.current_line_index = 0
 
-        # --- NEW: Define config path and load settings ---
         self.config_path = os.path.expanduser("~/.config/piper-qt/settings.json")
+        # --- NEW: Add voice, speed, and volume to default settings ---
         self.settings = {
             "font_family": "Noto Sans", "font_size": 14,
             "bg_color": "#ffffff", "text_color": "#000000",
-            "highlight_color": "#a8d8ff"
+            "highlight_color": "#a8d8ff",
+            "voice": "",
+            "speed": 10,
+            "volume": 100
         }
         self.load_settings() # Load saved settings over defaults
 
@@ -150,7 +153,7 @@ class MainWindow(QMainWindow):
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(QLabel("Voice:")); self.voice_combo = QComboBox(); self.populate_voices()
         controls_layout.addWidget(self.voice_combo)
-        controls_layout.addWidget(QLabel("Speed:")); self.speed_slider = QSlider(Qt.Orientation.Horizontal); self.speed_slider.setRange(5, 20); self.speed_slider.setValue(10)
+        controls_layout.addWidget(QLabel("Speed:")); self.speed_slider = QSlider(Qt.Orientation.Horizontal); self.speed_slider.setRange(5, 40); self.speed_slider.setValue(10)
         controls_layout.addWidget(self.speed_slider)
         self.speed_label = QLabel("1.0x"); controls_layout.addWidget(self.speed_label)
         controls_layout.addWidget(QLabel("Volume:")); self.volume_slider = QSlider(Qt.Orientation.Horizontal); self.volume_slider.setRange(0, 100); self.volume_slider.setValue(100)
@@ -186,6 +189,11 @@ class MainWindow(QMainWindow):
 
     def save_settings(self):
         try:
+            # --- NEW: Update settings from UI before saving ---
+            self.settings["voice"] = self.voice_combo.currentText()
+            self.settings["speed"] = self.speed_slider.value()
+            self.settings["volume"] = self.volume_slider.value()
+
             os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
             with open(self.config_path, 'w') as f:
                 json.dump(self.settings, f, indent=4)
@@ -222,6 +230,12 @@ class MainWindow(QMainWindow):
         font = QFont(self.settings["font_family"], self.settings["font_size"])
         self.text_edit.setFont(font)
         self.text_edit.setStyleSheet(f"background-color: {self.settings['bg_color']}; color: {self.settings['text_color']};")
+        # --- NEW: Apply loaded/default voice, speed, volume to UI ---
+        if self.settings["voice"]:
+            self.voice_combo.setCurrentText(self.settings["voice"])
+        self.speed_slider.setValue(self.settings["speed"])
+        self.volume_slider.setValue(self.settings["volume"])
+ 
     
     def update_highlight(self, line_index):
         self.clear_highlight()
@@ -233,7 +247,6 @@ class MainWindow(QMainWindow):
             cursor = QTextCursor(block)
             fmt = QTextCharFormat(); fmt.setBackground(QColor(self.settings["highlight_color"]))
             cursor.select(QTextCursor.SelectionType.BlockUnderCursor); cursor.mergeCharFormat(fmt)
-            # --- NEW: Conditional Auto-scroll logic ---
             # Get the rectangle of the current cursor (the highlighted block)
             cursor_rect = self.text_edit.cursorRect(cursor)
             viewport_height = self.text_edit.viewport().height()
