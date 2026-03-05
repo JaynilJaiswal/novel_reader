@@ -3,4 +3,7 @@ build/
 __pycache__/
 dist/
 *.spec
+*.tar.zst
+pkg/
+src/
 
