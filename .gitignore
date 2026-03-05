@@ -1,0 +1,9 @@
+build/
+.vscode/
+__pycache__/
+dist/
+*.spec
+*.tar.zst
+pkg/
+src/
+

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Edge Reader
+Comment=A highly optimized Edge-TTS reading application
+Exec=/usr/bin/edge-reader
+Icon=edge-tts
+Terminal=false
+Type=Application
+Categories=AudioVideo;Utility;

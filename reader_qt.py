@@ -163,6 +163,9 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(QLabel("Volume:")); self.volume_slider = QSlider(Qt.Orientation.Horizontal); self.volume_slider.setRange(0, 100); self.volume_slider.setValue(100)
         controls_layout.addWidget(self.volume_slider)
         self.volume_label = QLabel("100%"); controls_layout.addWidget(self.volume_label)
+        # --- NEW: Add ETA Label ---
+        self.eta_label = QLabel("ETA: 00:00")
+        controls_layout.addWidget(self.eta_label)
         layout.addLayout(controls_layout)
         self.text_edit = QTextEdit(); self.text_edit.setPlaceholderText("Enter text, or open a file from the File menu.")
         self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
@@ -177,9 +180,46 @@ class MainWindow(QMainWindow):
         self.save_button.clicked.connect(self.save_audio)
         self.speed_slider.valueChanged.connect(self.update_speed_label)
         self.volume_slider.valueChanged.connect(self.update_volume_label)
+        # --- NEW: Connect signals to update ETA ---
+        self.text_edit.textChanged.connect(self.update_eta)
+        self.speed_slider.valueChanged.connect(self.update_eta)
+        
+        self.apply_settings()
+        self.restore_session()
+        self.update_eta() # Calculate initial ETA on startup
         self.apply_settings()
         self.restore_session()
 
+    # --- MODIFIED: Dynamic ETA calculation with Hours:Minutes:Seconds ---
+    def update_eta(self, *args):
+        # 1. Determine which text to measure based on playback state
+        if self.playback_state in ["playing", "paused"] and self.lines:
+            # Only count words from the current line to the end
+            lines_to_read = self.lines[self.current_line_index:]
+            text = " ".join(lines_to_read)
+            prefix = "Time Left: "
+        else:
+            # Measure the entire text box
+            text = self.text_edit.toPlainText()
+            prefix = "Total ETA: "
+            
+        word_count = len(text.split())
+        base_wpm = 150.0 
+        speed_multiplier = self.speed_slider.value() / 10.0
+        adjusted_wpm = base_wpm * speed_multiplier
+        
+        # 2. Calculate and update the label with HH:MM:SS format
+        if adjusted_wpm > 0 and word_count > 0:
+            total_seconds = (word_count / adjusted_wpm) * 60
+            
+            hours = int(total_seconds // 3600)
+            minutes = int((total_seconds % 3600) // 60)
+            seconds = int(total_seconds % 60)
+            
+            self.eta_label.setText(f"{prefix}{hours:02d}:{minutes:02d}:{seconds:02d}")
+        else:
+            self.eta_label.setText(f"{prefix}00:00:00")
+            
     def play_audio(self):
         if self.playback_state == "stopped":
             cursor = self.text_edit.textCursor(); self.current_line_index = cursor.blockNumber()
@@ -288,6 +328,8 @@ class MainWindow(QMainWindow):
             if cursor_rect.bottom() > (viewport_height * 0.8):
                 scrollbar = self.text_edit.verticalScrollBar()
                 scrollbar.setValue(scrollbar.value() + viewport_height // 2)
+        self.update_eta() # Update ETA whenever we highlight a new line
+
     def update_speed_label(self, value): self.speed_label.setText(f"{value / 10.0:.1f}x")
     def update_volume_label(self, value): self.volume_label.setText(f"{value}%")
     def populate_voices(self):
@@ -304,6 +346,7 @@ class MainWindow(QMainWindow):
     def full_stop(self):
         self.playback_state = "stopped"; self.play_button.setText("▶ Play")
         self.stop_threads(reset_highlight=True); self.current_line_index = 0; self.lines = []
+        self.update_eta() # Reset ETA when stopping
     def on_playback_finished(self): self.full_stop()
     def stop_threads(self, reset_highlight=False):
         if hasattr(self, 'synth_worker'): self.synth_worker.stop(); self.synth_thread.quit(); self.synth_thread.wait()
