@@ -1,0 +1,4 @@
+PyQt6
+edge-tts
+sounddevice
+soundfile
