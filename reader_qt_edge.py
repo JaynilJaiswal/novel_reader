@@ -6,6 +6,7 @@ import sounddevice as sd
 import soundfile as sf
 import io
 import json
+import re  # NEW: Required for precise word highlighting
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QTextEdit, QPushButton, QComboBox, QHBoxLayout,
                              QFileDialog, QMessageBox, QLabel, QSlider, QDialog,
@@ -15,19 +16,11 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat, QFont, QAction, QIcon
 import edge_tts
 
-# A selection of highly realistic English neural voices from Edge-TTS
 EDGE_VOICES = [
-    "en-US-AriaNeural",
-    "en-US-AnaNeural",
-    "en-US-BrianNeural",
-    "en-US-EmmaNeural",
-    "en-US-JennyNeural",
-    "en-US-GuyNeural",
-    "en-US-ChristopherNeural",
-    "en-US-EricNeural",
-    "en-US-MichelleNeural",
-    "en-GB-SoniaNeural",
-    "en-GB-RyanNeural"
+    "en-US-AriaNeural", "en-US-AnaNeural", "en-US-BrianNeural",
+    "en-US-EmmaNeural", "en-US-JennyNeural", "en-US-GuyNeural",
+    "en-US-ChristopherNeural", "en-US-EricNeural", "en-US-MichelleNeural",
+    "en-GB-SoniaNeural", "en-GB-RyanNeural"
 ]
 
 class SettingsDialog(QDialog):
@@ -77,15 +70,11 @@ class EdgeSynthWorker(QObject):
     
     def __init__(self, lines, voice, audio_queue, speed_rate):
         super().__init__()
-        self.lines = lines
-        self.voice = voice
-        self.audio_queue = audio_queue
-        self.speed_rate = speed_rate
-        self._is_running = True
+        self.lines = lines; self.voice = voice; self.audio_queue = audio_queue
+        self.speed_rate = speed_rate; self._is_running = True
         
     def run(self):
-        try:
-            asyncio.run(self.async_run())
+        try: asyncio.run(self.async_run())
         except Exception as e:
             if self._is_running: self.error.emit(f"Edge-TTS worker error:\n\n{e}")
         finally:
@@ -101,32 +90,50 @@ class EdgeSynthWorker(QObject):
             try:
                 comm = edge_tts.Communicate(line, self.voice, rate=self.speed_rate)
                 audio_bytes = b""
+                boundaries = [] 
                 
                 async for chunk in comm.stream():
-                    if not self._is_running: 
-                        break 
+                    if not self._is_running: break 
+                    
                     if chunk["type"] == "audio":
                         audio_bytes += chunk["data"]
+                    elif chunk["type"] == "WordBoundary":
+                        # If Microsoft ever fixes their API, this will catch it natively
+                        time_sec = chunk["offset"] / 10_000_000.0
+                        boundaries.append({'time': time_sec, 'text': chunk['text']})
                 
-                if not self._is_running:
-                    break
+                if not self._is_running: break
                 
                 if audio_bytes:
                     data, samplerate = sf.read(io.BytesIO(audio_bytes), dtype='float32')
-                    self.audio_queue.put({'index': i, 'data': data, 'samplerate': samplerate})
+                    
+                    # --- NEW: The Mathematical Fallback Engine ---
+                    # If the API is broken and returns 0 boundaries, calculate our own!
+                    if len(boundaries) == 0:
+                        total_duration = len(data) / samplerate
+                        total_chars = max(1, len(line))
+                        
+                        # Find every word in the sentence
+                        for match in re.finditer(r"\b[\w']+\b", line):
+                            # Predict the timestamp based on the word's character position
+                            time_sec = (match.start() / total_chars) * total_duration
+                            boundaries.append({'time': time_sec, 'text': match.group()})
+                            
+                    self.audio_queue.put({
+                        'index': i, 'data': data, 'samplerate': samplerate, 'boundaries': boundaries
+                    })
                     
             except Exception as e:
-                print(f"Edge-TTS synthesis error on line '{line}': {e}")
-                continue
+                print(f"Edge-TTS synthesis error on line '{line}': {e}"); continue
                 
         await asyncio.sleep(0.1)
             
-    def stop(self): 
-        self._is_running = False
+    def stop(self): self._is_running = False
 
 class AudioPlaybackWorker(QObject):
     playback_finished = pyqtSignal()
     highlight_line = pyqtSignal(int)
+    highlight_word = pyqtSignal(int, int, str) # NEW: line_index, word_index, word_text
     line_completed = pyqtSignal(int)
     
     def __init__(self, audio_queue, volume, line_index_offset):
@@ -139,7 +146,10 @@ class AudioPlaybackWorker(QObject):
             while self._is_running:
                 item = self.audio_queue.get()
                 if item is None: break
+                
                 local_line_index = item['index']; audio_data = item['data']; samplerate = item['samplerate']
+                boundaries = item.get('boundaries', []) # Get the word boundaries
+                
                 if not self._is_running: break
                 
                 original_line_index = self.line_index_offset + local_line_index
@@ -153,14 +163,26 @@ class AudioPlaybackWorker(QObject):
                     self.stream.start()
                 
                 chunk_size = int(samplerate * 0.05) 
+                frames_played = 0
+                current_word_idx = 0
+                
                 for i in range(0, len(audio_data), chunk_size):
                     if not self._is_running: break
                     chunk = audio_data[i:i + chunk_size]
+                    
+                    # --- NEW: Word boundary synchronization ---
+                    current_time = frames_played / samplerate
+                    # Peek ahead: if the current 50ms block hits a boundary, emit the signal
+                    while current_word_idx < len(boundaries) and current_time >= boundaries[current_word_idx]['time']:
+                        self.highlight_word.emit(original_line_index, current_word_idx, boundaries[current_word_idx]['text'])
+                        current_word_idx += 1
+                        
                     try: self.stream.write(chunk * self.volume) 
                     except Exception as e: print(f"Stream write error: {e}"); break
+                    
+                    frames_played += len(chunk)
                 
-                if self._is_running:
-                    self.line_completed.emit(original_line_index)
+                if self._is_running: self.line_completed.emit(original_line_index)
 
         except Exception as e: print(f"Playback error: {e}")
         finally:
@@ -184,6 +206,9 @@ class MainWindow(QMainWindow):
         self.lines = []; self.line_word_counts = []; self.words_remaining = 0
         self.last_highlighted_block = None; self.playback_state = "stopped"; self.current_line_index = 0
         
+        self.last_word_cursor = None # Track the currently highlighted word
+        self.current_line_search_pos = 0 # Track position to handle duplicate words natively
+        
         self.config_path = os.path.expanduser("~/.config/edge-qt/settings.json")
         self.settings = {
             "font_family": "Noto Sans", "font_size": 14,
@@ -204,7 +229,6 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.voice_combo)
         
         controls_layout.addWidget(QLabel("Speed:")); self.speed_slider = QSlider(Qt.Orientation.Horizontal)
-        # --- FIX: Max slider range capped at 30 to reflect Azure's hard +200% speed limit ---
         self.speed_slider.setRange(5, 30); self.speed_slider.setValue(10)
         controls_layout.addWidget(self.speed_slider)
         self.speed_label = QLabel("1.0x"); controls_layout.addWidget(self.speed_label)
@@ -314,6 +338,8 @@ class MainWindow(QMainWindow):
         self.synth_worker.moveToThread(self.synth_thread)
         
         self.audio_player.highlight_line.connect(self.update_highlight)
+        # --- NEW: Connect the word signal ---
+        self.audio_player.highlight_word.connect(self.update_word_highlight)
         self.audio_player.line_completed.connect(self.mark_line_as_completed)
         self.synth_worker.error.connect(self.show_error)
         self.audio_player.playback_finished.connect(self.on_playback_finished)
@@ -325,28 +351,113 @@ class MainWindow(QMainWindow):
         self.playback_state = "playing"; self.play_button.setText("⏸ Pause")
         self.stop_button.setEnabled(True); self.text_edit.setReadOnly(True)
 
+    # --- NEW: Core UI Engine for precise word targeting ---
+    def update_word_highlight(self, line_index, word_index, word_text):
+        if self.current_line_index != line_index: return
+
+        block = self.text_edit.document().findBlockByNumber(line_index)
+        if not block.isValid(): return
+        
+        # Reset search tracker if it's the start of a new line
+        if word_index == 0:
+            self.current_line_search_pos = 0
+
+        # 1. Transform the previous word into the 'completed' state
+        if self.last_word_cursor:
+            fmt = QTextCharFormat()
+            # Remove the blue background
+            fmt.setBackground(Qt.GlobalColor.transparent) 
+            # --- FIX: Set the text to your completed color (Yellow) ---
+            fmt.setForeground(QColor(self.settings["completed_color"])) 
+            self.last_word_cursor.mergeCharFormat(fmt)
+            self.last_word_cursor = None
+
+        text = block.text()
+        clean_word = word_text.strip(".,!?\"';:()[]{} ")
+        if not clean_word: return
+        
+        # 2. Progressive Search
+        escaped_word = re.escape(clean_word)
+        match = re.search(escaped_word, text[self.current_line_search_pos:], re.IGNORECASE)
+
+        if match:
+            start = self.current_line_search_pos + match.start()
+            end = self.current_line_search_pos + match.end()
+            self.current_line_search_pos = end # Save position for next word
+
+            cursor = QTextCursor(block)
+            cursor.setPosition(block.position() + start)
+            cursor.setPosition(block.position() + end, QTextCursor.MoveMode.KeepAnchor)
+
+            # 3. Paint the active word (Blue BG, White Text)
+            fmt = QTextCharFormat()
+            fmt.setBackground(QColor(self.settings["highlight_color"]))
+            fmt.setForeground(QColor(self.settings["text_color"]))
+            cursor.mergeCharFormat(fmt)
+            
+            self.last_word_cursor = cursor
+
     def mark_line_as_completed(self, line_index):
         if self.last_highlighted_block and self.last_highlighted_block.blockNumber() == line_index:
             temp_cursor = QTextCursor(self.last_highlighted_block)
-            fmt = QTextCharFormat(); fmt.setForeground(QColor(self.settings["completed_color"]))
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(self.settings["completed_color"]))
             fmt.setBackground(Qt.GlobalColor.transparent)
-            temp_cursor.select(QTextCursor.SelectionType.BlockUnderCursor); temp_cursor.mergeCharFormat(fmt)
+            temp_cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            temp_cursor.mergeCharFormat(fmt)
             self.last_highlighted_block = None 
             
+            # Ensure the last word highlight dies with the line
+            if hasattr(self, 'last_word_cursor') and self.last_word_cursor:
+                self.last_word_cursor.setCharFormat(fmt)
+                self.last_word_cursor = None
+            
         self.playback_cursor.movePosition(QTextCursor.MoveOperation.NextBlock)
-        if line_index < len(self.line_word_counts): self.words_remaining -= self.line_word_counts[line_index]
+        if line_index < len(self.line_word_counts): 
+            self.words_remaining -= self.line_word_counts[line_index]
         self.update_eta()
 
+    def update_highlight(self, line_index):
+        self.clear_highlight()
+        self.current_line_index = line_index
+        
+        if self.playback_cursor.blockNumber() != line_index:
+            self.playback_cursor = QTextCursor(self.text_edit.document().findBlockByNumber(line_index))
+            
+        block = self.playback_cursor.block()
+        if block.isValid():
+            self.last_highlighted_block = block # Save for completion coloring later
+            
+            # --- Auto-Scroll Logic (No background coloring here anymore) ---
+            cursor_rect = self.text_edit.cursorRect(self.playback_cursor)
+            viewport_height = self.text_edit.viewport().height()
+            
+            if cursor_rect.bottom() > (viewport_height * 0.7) or cursor_rect.top() < (viewport_height * 0.3):
+                scrollbar = self.text_edit.verticalScrollBar()
+                center_offset = cursor_rect.top() - (viewport_height // 2)
+                scrollbar.setValue(scrollbar.value() + center_offset)
+                
+        self.update_eta()
+        
     def clear_highlight(self, force_clear_all=False):
-        clear_format = QTextCharFormat(); clear_format.setBackground(Qt.GlobalColor.transparent)
+        clear_format = QTextCharFormat()
+        clear_format.setBackground(QColor(self.settings["bg_color"]))
+        clear_format.setForeground(QColor(self.settings["text_color"]))
+        
         current_visible_cursor = self.text_edit.textCursor()
+        
+        # Wipe out any orphaned word highlights before clearing the line
+        if hasattr(self, 'last_word_cursor') and self.last_word_cursor:
+            self.last_word_cursor.mergeCharFormat(clear_format)
+            self.last_word_cursor = None
+            
         if force_clear_all:
-             temp_cursor = QTextCursor(self.text_edit.document()); temp_cursor.select(QTextCursor.SelectionType.Document)
-             temp_cursor.mergeCharFormat(clear_format); temp_cursor.mergeCharFormat(self.text_edit.currentCharFormat()) 
-        elif hasattr(self, 'last_highlighted_block') and self.last_highlighted_block and self.last_highlighted_block.isValid():
-            temp_cursor = QTextCursor(self.last_highlighted_block); temp_cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
-            temp_cursor.mergeCharFormat(clear_format)
-        self.last_highlighted_block = None; self.text_edit.setTextCursor(current_visible_cursor)
+             temp_cursor = QTextCursor(self.text_edit.document())
+             temp_cursor.select(QTextCursor.SelectionType.Document)
+             temp_cursor.mergeCharFormat(clear_format)
+             
+        self.last_highlighted_block = None
+        self.text_edit.setTextCursor(current_visible_cursor)
 
     def update_eta(self, *args):
         if self.playback_state in ["playing", "paused"] and hasattr(self, 'words_remaining'):
@@ -354,9 +465,7 @@ class MainWindow(QMainWindow):
         else:
             text = self.text_edit.toPlainText(); word_count = len(text.split()); prefix = "Total ETA: "
             
-        # --- FIX: Adjusted to 165 WPM for accurate Edge neural reading speed ---
-        base_wpm = 165.0
-        speed_multiplier = self.speed_slider.value() / 10.0; adjusted_wpm = base_wpm * speed_multiplier
+        base_wpm = 165.0; speed_multiplier = self.speed_slider.value() / 10.0; adjusted_wpm = base_wpm * speed_multiplier
         if adjusted_wpm > 0 and word_count > 0:
             total_seconds = (word_count / adjusted_wpm) * 60
             hours = int(total_seconds // 3600); minutes = int((total_seconds % 3600) // 60); seconds = int(total_seconds % 60)
@@ -403,22 +512,6 @@ class MainWindow(QMainWindow):
         self.text_edit.setFont(font); self.text_edit.setStyleSheet(f"background-color: {self.settings['bg_color']}; color: {self.settings['text_color']};")
         if self.settings["voice"]: self.voice_combo.setCurrentText(self.settings["voice"])
         self.speed_slider.setValue(self.settings["speed"]); self.volume_slider.setValue(self.settings["volume"])
-        
-    def update_highlight(self, line_index):
-        self.clear_highlight(); self.current_line_index = line_index
-        if self.playback_cursor.blockNumber() != line_index:
-            self.playback_cursor = QTextCursor(self.text_edit.document().findBlockByNumber(line_index))
-        block = self.playback_cursor.block()
-        if block.isValid():
-            self.last_highlighted_block = block
-            fmt = QTextCharFormat(); fmt.setBackground(QColor(self.settings["highlight_color"]))
-            self.playback_cursor.select(QTextCursor.SelectionType.BlockUnderCursor); self.playback_cursor.mergeCharFormat(fmt)
-            self.playback_cursor.clearSelection(); self.text_edit.setTextCursor(self.playback_cursor)
-            cursor_rect = self.text_edit.cursorRect(self.playback_cursor); viewport_height = self.text_edit.viewport().height()
-            if cursor_rect.bottom() > (viewport_height * 0.7) or cursor_rect.top() < (viewport_height * 0.3):
-                scrollbar = self.text_edit.verticalScrollBar(); center_offset = cursor_rect.top() - (viewport_height // 2)
-                scrollbar.setValue(scrollbar.value() + center_offset)
-        self.update_eta()
         
     def update_speed_label(self, value): self.speed_label.setText(f"{value / 10.0:.1f}x")
     def update_volume_label(self, value): self.volume_label.setText(f"{value}%")
