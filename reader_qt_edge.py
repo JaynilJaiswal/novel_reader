@@ -84,13 +84,11 @@ class EdgeSynthWorker(QObject):
         self._is_running = True
         
     def run(self):
-        # asyncio.run automatically manages loop creation, task cancellation, and clean teardown
         try:
             asyncio.run(self.async_run())
         except Exception as e:
             if self._is_running: self.error.emit(f"Edge-TTS worker error:\n\n{e}")
         finally:
-            # We use put_nowait here just in case the queue is full when aborted
             try: self.audio_queue.put_nowait(None)
             except queue.Full: pass
             self.finished.emit()
@@ -106,7 +104,7 @@ class EdgeSynthWorker(QObject):
                 
                 async for chunk in comm.stream():
                     if not self._is_running: 
-                        break # Break instead of returning so we hit the cleanup block
+                        break 
                     if chunk["type"] == "audio":
                         audio_bytes += chunk["data"]
                 
@@ -115,17 +113,12 @@ class EdgeSynthWorker(QObject):
                 
                 if audio_bytes:
                     data, samplerate = sf.read(io.BytesIO(audio_bytes), dtype='float32')
-                    # This put() call is synchronous. If maxsize is 3, it will intentionally
-                    # freeze this background thread right here until the player consumes a chunk.
                     self.audio_queue.put({'index': i, 'data': data, 'samplerate': samplerate})
                     
             except Exception as e:
                 print(f"Edge-TTS synthesis error on line '{line}': {e}")
                 continue
                 
-        # --- NEW: Graceful Teardown ---
-        # Yield control back to the event loop for a fraction of a second so 
-        # aiohttp can gracefully close the underlying HTTP/SSL connections.
         await asyncio.sleep(0.1)
             
     def stop(self): 
@@ -211,7 +204,8 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.voice_combo)
         
         controls_layout.addWidget(QLabel("Speed:")); self.speed_slider = QSlider(Qt.Orientation.Horizontal)
-        self.speed_slider.setRange(5, 40); self.speed_slider.setValue(10)
+        # --- FIX: Max slider range capped at 30 to reflect Azure's hard +200% speed limit ---
+        self.speed_slider.setRange(5, 30); self.speed_slider.setValue(10)
         controls_layout.addWidget(self.speed_slider)
         self.speed_label = QLabel("1.0x"); controls_layout.addWidget(self.speed_label)
         
@@ -306,8 +300,6 @@ class MainWindow(QMainWindow):
         self.words_remaining = sum(self.line_word_counts[self.current_line_index:])
         self.playback_cursor = QTextCursor(self.text_edit.document().findBlockByNumber(self.current_line_index))
         
-        # --- NEW: Convert slider value to Edge-TTS rate string ---
-        # 10 -> "+0%", 15 -> "+50%", 5 -> "-50%"
         speed_percentage = int(((self.speed_slider.value() / 10.0) - 1.0) * 100)
         rate_str = f"{speed_percentage:+d}%"
         volume = self.volume_slider.value() / 100.0
@@ -362,7 +354,9 @@ class MainWindow(QMainWindow):
         else:
             text = self.text_edit.toPlainText(); word_count = len(text.split()); prefix = "Total ETA: "
             
-        base_wpm = 150.0; speed_multiplier = self.speed_slider.value() / 10.0; adjusted_wpm = base_wpm * speed_multiplier
+        # --- FIX: Adjusted to 165 WPM for accurate Edge neural reading speed ---
+        base_wpm = 165.0
+        speed_multiplier = self.speed_slider.value() / 10.0; adjusted_wpm = base_wpm * speed_multiplier
         if adjusted_wpm > 0 and word_count > 0:
             total_seconds = (word_count / adjusted_wpm) * 60
             hours = int(total_seconds // 3600); minutes = int((total_seconds % 3600) // 60); seconds = int(total_seconds % 60)

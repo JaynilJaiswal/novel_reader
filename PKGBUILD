@@ -16,7 +16,7 @@ package() {
     mkdir -p "${pkgdir}/usr/share/pixmaps"
 
     # 2. Install the PyInstaller binary
-    install -Dm755 "${srcdir}/../dist/reader_qt_new" "${pkgdir}/usr/bin/edge-reader"
+    install -Dm755 "${srcdir}/../dist/reader_qt_edge" "${pkgdir}/usr/bin/edge-reader"
 
     # 3. Install the Desktop entry and Icon
     install -Dm644 "${srcdir}/edge-reader.desktop" "${pkgdir}/usr/share/applications/edge-reader.desktop"
