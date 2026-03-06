@@ -1,8 +1,10 @@
 import sys
 import os
+import asyncio
 import queue
 import sounddevice as sd
 import soundfile as sf
+import io
 import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QTextEdit, QPushButton, QComboBox, QHBoxLayout,
@@ -11,19 +13,21 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QColorDialog)
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat, QFont, QAction, QIcon
+import edge_tts
 
-try:
-    from kokoro import KPipeline
-except ImportError:
-    print("Please install kokoro: pip install kokoro")
-    sys.exit(1)
-
-# All standard Kokoro v1.0 Voices
-KOKORO_VOICES = [
-    "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore", "af_nicole", "af_nova", "af_river", "af_sky",
-    "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael", "am_onyx", "am_puck", "am_santa",
-    "bf_alice", "bf_emma", "bf_isabella", "bf_lily", 
-    "bm_daniel", "bm_fable", "bm_george", "bm_lewis"
+# A selection of highly realistic English neural voices from Edge-TTS
+EDGE_VOICES = [
+    "en-US-AriaNeural",
+    "en-US-AnaNeural",
+    "en-US-BrianNeural",
+    "en-US-EmmaNeural",
+    "en-US-JennyNeural",
+    "en-US-GuyNeural",
+    "en-US-ChristopherNeural",
+    "en-US-EricNeural",
+    "en-US-MichelleNeural",
+    "en-GB-SoniaNeural",
+    "en-GB-RyanNeural"
 ]
 
 class SettingsDialog(QDialog):
@@ -67,7 +71,7 @@ class SettingsDialog(QDialog):
     def get_settings(self): return self.settings
 
 
-class KokoroSynthWorker(QObject):
+class EdgeSynthWorker(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
     
@@ -80,44 +84,51 @@ class KokoroSynthWorker(QObject):
         self._is_running = True
         
     def run(self):
+        # asyncio.run automatically manages loop creation, task cancellation, and clean teardown
         try:
-            # Determine language based on voice prefix ('a' for American, 'b' for British)
-            lang_code = 'b' if self.voice.startswith('b') else 'a'
-            
-            # Initialize pipeline. 
-            # Note: The first time you press play, it will download the ~300MB model to ~/.cache/huggingface/
-            # device='cuda' forces it into your RTX 3060 VRAM for instant generation.
-            pipeline = KPipeline(lang_code=lang_code, device='cuda')
-            
-            for i, line in enumerate(self.lines):
-                if not self._is_running: break
-                if not line.strip(): continue
-                
-                # split_pattern='' prevents Kokoro from cutting up the sentence itself
-                generator = pipeline(line, voice=self.voice, speed=self.speed_rate, split_pattern=r'\n+')
-                
-                for _, _, audio in generator:
-                    if not self._is_running: break
-                    if audio is None: continue
-                    
-                    # Backpressure: block until queue has space or we are stopped
-                    while self._is_running:
-                        try:
-                            # Put audio into queue, timeout allows checking _is_running
-                            # Kokoro natively outputs at 24000 Hz
-                            self.audio_queue.put({'index': i, 'data': audio, 'samplerate': 24000}, timeout=0.1)
-                            break
-                        except queue.Full:
-                            continue
-                            
+            asyncio.run(self.async_run())
         except Exception as e:
-            if self._is_running: self.error.emit(f"Kokoro worker error:\n\n{e}")
+            if self._is_running: self.error.emit(f"Edge-TTS worker error:\n\n{e}")
         finally:
+            # We use put_nowait here just in case the queue is full when aborted
             try: self.audio_queue.put_nowait(None)
             except queue.Full: pass
             self.finished.emit()
+
+    async def async_run(self):
+        for i, line in enumerate(self.lines):
+            if not self._is_running: break
+            if not line.strip(): continue 
             
-    def stop(self):
+            try:
+                comm = edge_tts.Communicate(line, self.voice, rate=self.speed_rate)
+                audio_bytes = b""
+                
+                async for chunk in comm.stream():
+                    if not self._is_running: 
+                        break # Break instead of returning so we hit the cleanup block
+                    if chunk["type"] == "audio":
+                        audio_bytes += chunk["data"]
+                
+                if not self._is_running:
+                    break
+                
+                if audio_bytes:
+                    data, samplerate = sf.read(io.BytesIO(audio_bytes), dtype='float32')
+                    # This put() call is synchronous. If maxsize is 3, it will intentionally
+                    # freeze this background thread right here until the player consumes a chunk.
+                    self.audio_queue.put({'index': i, 'data': data, 'samplerate': samplerate})
+                    
+            except Exception as e:
+                print(f"Edge-TTS synthesis error on line '{line}': {e}")
+                continue
+                
+        # --- NEW: Graceful Teardown ---
+        # Yield control back to the event loop for a fraction of a second so 
+        # aiohttp can gracefully close the underlying HTTP/SSL connections.
+        await asyncio.sleep(0.1)
+            
+    def stop(self): 
         self._is_running = False
 
 class AudioPlaybackWorker(QObject):
@@ -175,17 +186,17 @@ class AudioPlaybackWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Kokoro-Qt TTS Reader")
+        self.setWindowTitle("Edge-Qt TTS Reader")
         self.setGeometry(100, 100, 800, 600)
         self.lines = []; self.line_word_counts = []; self.words_remaining = 0
         self.last_highlighted_block = None; self.playback_state = "stopped"; self.current_line_index = 0
         
-        self.config_path = os.path.expanduser("~/.config/kokoro-qt/settings.json")
+        self.config_path = os.path.expanduser("~/.config/edge-qt/settings.json")
         self.settings = {
             "font_family": "Noto Sans", "font_size": 14,
             "bg_color": "#ffffff", "text_color": "#000000",
             "highlight_color": "#a8d8ff", "completed_color": "#808080",
-            "voice": "af_heart", "speed": 10, "volume": 100,
+            "voice": "en-US-AriaNeural", "speed": 10, "volume": 100,
             "session_text": "", "session_cursor_line": 0
         }
         self.load_settings()
@@ -196,7 +207,7 @@ class MainWindow(QMainWindow):
         controls_layout = QHBoxLayout()
         
         controls_layout.addWidget(QLabel("Voice:")); self.voice_combo = QComboBox()
-        self.voice_combo.addItems(KOKORO_VOICES)
+        self.voice_combo.addItems(EDGE_VOICES)
         controls_layout.addWidget(self.voice_combo)
         
         controls_layout.addWidget(QLabel("Speed:")); self.speed_slider = QSlider(Qt.Orientation.Horizontal)
@@ -295,17 +306,19 @@ class MainWindow(QMainWindow):
         self.words_remaining = sum(self.line_word_counts[self.current_line_index:])
         self.playback_cursor = QTextCursor(self.text_edit.document().findBlockByNumber(self.current_line_index))
         
-        speed_float = self.speed_slider.value() / 10.0
+        # --- NEW: Convert slider value to Edge-TTS rate string ---
+        # 10 -> "+0%", 15 -> "+50%", 5 -> "-50%"
+        speed_percentage = int(((self.speed_slider.value() / 10.0) - 1.0) * 100)
+        rate_str = f"{speed_percentage:+d}%"
         volume = self.volume_slider.value() / 100.0
         
-        # Maxsize=3 creates backpressure so Kokoro doesn't prefetch infinity into your VRAM
-        self.audio_queue = queue.Queue(maxsize=3)
+        self.audio_queue = queue.Queue(maxsize=5)
         self.playback_thread = QThread()
         self.audio_player = AudioPlaybackWorker(self.audio_queue, volume, self.current_line_index)
         self.audio_player.moveToThread(self.playback_thread)
         
         self.synth_thread = QThread()
-        self.synth_worker = KokoroSynthWorker(lines_to_play, self.voice_combo.currentText(), self.audio_queue, speed_float)
+        self.synth_worker = EdgeSynthWorker(lines_to_play, self.voice_combo.currentText(), self.audio_queue, rate_str)
         self.synth_worker.moveToThread(self.synth_thread)
         
         self.audio_player.highlight_line.connect(self.update_highlight)
