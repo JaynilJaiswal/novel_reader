@@ -5,6 +5,16 @@ import queue
 import sounddevice as sd
 import soundfile as sf
 import io
+import hashlib
+import glob
+import logging
+
+# Configure the global logging format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s'
+)
+
 import json
 import re  # NEW: Required for precise word highlighting
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -73,6 +83,30 @@ class EdgeSynthWorker(QObject):
         self.lines = lines; self.voice = voice; self.audio_queue = audio_queue
         self.speed_rate = speed_rate; self._is_running = True
         
+        # Initialize a specific logger for this class
+        self.logger = logging.getLogger("EdgeSynthCache")
+        
+        # Ensure cache directory exists
+        self.cache_dir = os.path.expanduser("~/.cache/edge-qt/audio")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.clean_lru_cache() # Run cleanup on startup
+        
+    def clean_lru_cache(self, max_files=200):
+        """Keep cache from growing infinitely. Deletes oldest files if over limit."""
+        try:
+            files = glob.glob(os.path.join(self.cache_dir, "*.wav"))
+            if len(files) > max_files:
+                self.logger.info(f"LRU Cache limit exceeded ({len(files)} files). Cleaning up...")
+                # Sort by last accessed time (oldest first)
+                files.sort(key=os.path.getatime)
+                for old_wav in files[:-max_files]:
+                    os.remove(old_wav)
+                    old_json = old_wav.replace('.wav', '.json')
+                    if os.path.exists(old_json): os.remove(old_json)
+                self.logger.info("Cache cleanup complete.")
+        except Exception as e: 
+            self.logger.error(f"Cache cleanup failed: {e}")
+
     def run(self):
         try: asyncio.run(self.async_run())
         except Exception as e:
@@ -87,18 +121,45 @@ class EdgeSynthWorker(QObject):
             if not self._is_running: break
             if not line.strip(): continue 
             
+            # 1. Generate unique hash
+            hash_string = f"{line.strip()}_{self.voice}_{self.speed_rate}".encode('utf-8')
+            hash_id = hashlib.md5(hash_string).hexdigest()
+            
+            wav_path = os.path.join(self.cache_dir, f"{hash_id}.wav")
+            json_path = os.path.join(self.cache_dir, f"{hash_id}.json")
+            
+            # 2. CACHE HIT
+            if os.path.exists(wav_path) and os.path.exists(json_path):
+                try:
+                    data, samplerate = sf.read(wav_path, dtype='float32')
+                    with open(json_path, 'r') as f: boundaries = json.load(f)
+                    os.utime(wav_path, None) 
+                    
+                    self.logger.info(f"Cache HIT  | Line {i}")
+                    
+                    # --- FIX: Safe queue insertion with timeout ---
+                    item = {'index': i, 'data': data, 'samplerate': samplerate, 'boundaries': boundaries}
+                    while self._is_running:
+                        try:
+                            self.audio_queue.put(item, timeout=0.1)
+                            break
+                        except queue.Full: pass
+                    continue 
+                except Exception as e:
+                    self.logger.warning(f"Cache read error: {e}. Falling back to network.")
+
+            # 3. CACHE MISS
             try:
+                self.logger.info(f"Cache MISS | Line {i} | Downloading...")
                 comm = edge_tts.Communicate(line, self.voice, rate=self.speed_rate)
                 audio_bytes = b""
                 boundaries = [] 
                 
                 async for chunk in comm.stream():
                     if not self._is_running: break 
-                    
                     if chunk["type"] == "audio":
                         audio_bytes += chunk["data"]
                     elif chunk["type"] == "WordBoundary":
-                        # If Microsoft ever fixes their API, this will catch it natively
                         time_sec = chunk["offset"] / 10_000_000.0
                         boundaries.append({'time': time_sec, 'text': chunk['text']})
                 
@@ -107,28 +168,33 @@ class EdgeSynthWorker(QObject):
                 if audio_bytes:
                     data, samplerate = sf.read(io.BytesIO(audio_bytes), dtype='float32')
                     
-                    # --- NEW: The Mathematical Fallback Engine ---
-                    # If the API is broken and returns 0 boundaries, calculate our own!
                     if len(boundaries) == 0:
+                        import re
                         total_duration = len(data) / samplerate
                         total_chars = max(1, len(line))
-                        
-                        # Find every word in the sentence
                         for match in re.finditer(r"\b[\w']+\b", line):
-                            # Predict the timestamp based on the word's character position
                             time_sec = (match.start() / total_chars) * total_duration
                             boundaries.append({'time': time_sec, 'text': match.group()})
+                    
+                    sf.write(wav_path, data, samplerate)
+                    with open(json_path, 'w') as f: json.dump(boundaries, f)
                             
-                    self.audio_queue.put({
-                        'index': i, 'data': data, 'samplerate': samplerate, 'boundaries': boundaries
-                    })
+                    # --- FIX: Safe queue insertion with timeout ---
+                    item = {'index': i, 'data': data, 'samplerate': samplerate, 'boundaries': boundaries}
+                    while self._is_running:
+                        try:
+                            self.audio_queue.put(item, timeout=0.1)
+                            break
+                        except queue.Full: pass
                     
             except Exception as e:
-                print(f"Edge-TTS synthesis error on line '{line}': {e}"); continue
+                self.logger.error(f"Edge-TTS synthesis error on line '{line}': {e}")
+                continue
                 
         await asyncio.sleep(0.1)
-            
-    def stop(self): self._is_running = False
+        
+    def stop(self): 
+        self._is_running = False
 
 class AudioPlaybackWorker(QObject):
     playback_finished = pyqtSignal()
@@ -313,10 +379,21 @@ class MainWindow(QMainWindow):
 
     def play_audio(self):
         if self.playback_state == "stopped":
-            cursor = self.text_edit.textCursor(); self.current_line_index = cursor.blockNumber()
+            cursor = self.text_edit.textCursor()
+            self.current_line_index = cursor.blockNumber()
             full_text = self.text_edit.toPlainText()
             self.lines = [line for line in full_text.splitlines()]
             self.line_word_counts = [len(line.split()) for line in self.lines]
+            
+            # --- NEW: Look-Ahead Eraser ---
+            # If we start playing, ensure all upcoming text is reset to white (unread).
+            # This prevents old yellow text from remaining if we click backward in the document.
+            reset_cursor = QTextCursor(self.text_edit.document().findBlockByNumber(self.current_line_index))
+            reset_cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(self.settings["text_color"]))
+            fmt.setBackground(Qt.GlobalColor.transparent)
+            reset_cursor.mergeCharFormat(fmt)
             
         lines_to_play = self.lines[self.current_line_index:]
         if not lines_to_play: self.full_stop(); return
@@ -338,7 +415,6 @@ class MainWindow(QMainWindow):
         self.synth_worker.moveToThread(self.synth_thread)
         
         self.audio_player.highlight_line.connect(self.update_highlight)
-        # --- NEW: Connect the word signal ---
         self.audio_player.highlight_word.connect(self.update_word_highlight)
         self.audio_player.line_completed.connect(self.mark_line_as_completed)
         self.synth_worker.error.connect(self.show_error)
@@ -346,10 +422,13 @@ class MainWindow(QMainWindow):
         
         self.playback_thread.started.connect(self.audio_player.run)
         self.synth_thread.started.connect(self.synth_worker.run)
-        self.playback_thread.start(); self.synth_thread.start()
+        self.playback_thread.start()
+        self.synth_thread.start()
         
-        self.playback_state = "playing"; self.play_button.setText("⏸ Pause")
-        self.stop_button.setEnabled(True); self.text_edit.setReadOnly(True)
+        self.playback_state = "playing"
+        self.play_button.setText("⏸ Pause")
+        self.stop_button.setEnabled(True)
+        self.text_edit.setReadOnly(True)
 
     # --- NEW: Core UI Engine for precise word targeting ---
     def update_word_highlight(self, line_index, word_index, word_text):
@@ -522,23 +601,72 @@ class MainWindow(QMainWindow):
         self.playback_state = "paused"; self.play_button.setText("▶ Resume")
         self.stop_threads(reset_highlight=False)
     def full_stop(self):
-        self.playback_state = "stopped"; self.play_button.setText("▶ Play")
-        self.stop_threads(reset_highlight=True); self.lines = []; self.update_eta()
+        self.playback_state = "stopped"
+        self.play_button.setText("▶ Play")
+        
+        # 1. Stop threads safely WITHOUT wiping the entire document's formatting
+        self.stop_threads(reset_highlight=False)
+        
+        # 2. Lock in the 'completed' yellow color for the exact word we stopped on
+        fmt = QTextCharFormat()
+        fmt.setBackground(Qt.GlobalColor.transparent)
+        fmt.setForeground(QColor(self.settings["completed_color"]))
+        
+        if hasattr(self, 'last_word_cursor') and self.last_word_cursor:
+            self.last_word_cursor.mergeCharFormat(fmt)
+            self.last_word_cursor = None
+            
+        # Clear any leftover background highlight from the active block, keeping text yellow
+        if hasattr(self, 'last_highlighted_block') and self.last_highlighted_block:
+            temp_cursor = QTextCursor(self.last_highlighted_block)
+            temp_cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+            clear_bg = QTextCharFormat()
+            clear_bg.setBackground(Qt.GlobalColor.transparent)
+            temp_cursor.mergeCharFormat(clear_bg)
+            self.last_highlighted_block = None
+
+        # 3. Move the physical UI cursor exactly to the line we stopped at
+        cursor = QTextCursor(self.text_edit.document().findBlockByNumber(self.current_line_index))
+        self.text_edit.setTextCursor(cursor)
+        
+        self.lines = []
+        self.update_eta()
     def on_playback_finished(self): 
         if self.playback_state == "playing": self.full_stop()
     def stop_threads(self, reset_highlight=False):
-        if hasattr(self, 'audio_player'):
+        # 1. Safely signal audio player to stop
+        if hasattr(self, 'audio_player') and getattr(self, 'audio_player', None) is not None:
             try: self.audio_player.playback_finished.disconnect(self.on_playback_finished)
             except Exception: pass
-            self.audio_player.stop(); self.playback_thread.quit(); self.playback_thread.wait()
-            self.audio_player.deleteLater(); self.playback_thread.deleteLater()
-            del self.audio_player; del self.playback_thread
-        if hasattr(self, 'synth_worker'): 
-            self.synth_worker.stop(); self.synth_thread.quit(); self.synth_thread.wait()
-            self.synth_worker.deleteLater(); self.synth_thread.deleteLater()
-            del self.synth_worker; del self.synth_thread
+            self.audio_player.stop()
+            
+        # 2. Safely signal synth worker to stop
+        if hasattr(self, 'synth_worker') and getattr(self, 'synth_worker', None) is not None:
+            self.synth_worker.stop()
+            
+        # 3. Wait for audio thread to close
+        if hasattr(self, 'playback_thread') and getattr(self, 'playback_thread', None) is not None:
+            self.playback_thread.quit()
+            self.playback_thread.wait()
+            if hasattr(self, 'audio_player'):
+                self.audio_player.deleteLater()
+                del self.audio_player
+            self.playback_thread.deleteLater()
+            del self.playback_thread
+            
+        # 4. Wait for synth thread to close
+        if hasattr(self, 'synth_thread') and getattr(self, 'synth_thread', None) is not None:
+            self.synth_thread.quit()
+            self.synth_thread.wait()
+            if hasattr(self, 'synth_worker'):
+                self.synth_worker.deleteLater()
+                del self.synth_worker
+            self.synth_thread.deleteLater()
+            del self.synth_thread
+            
         if reset_highlight: self.clear_highlight(force_clear_all=True)
-        self.text_edit.setReadOnly(False); self.stop_button.setEnabled(False)
+        self.text_edit.setReadOnly(False)
+        self.stop_button.setEnabled(False)
         
     def show_error(self, message): QMessageBox.critical(self, "Error", message); self.full_stop()
     def closeEvent(self, event): self.save_settings(); self.full_stop(); event.accept()
