@@ -21,9 +21,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QPushButton, QComboBox, QHBoxLayout,
                              QFileDialog, QMessageBox, QLabel, QSlider, QDialog,
                              QFormLayout, QFontComboBox, QSpinBox, QDialogButtonBox,
-                             QColorDialog)
+                             QColorDialog, QLineEdit)
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, Qt
-from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat, QFont, QAction, QIcon
+from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat, QFont, QAction, QIcon, QTextDocument, QKeySequence
 import edge_tts
 
 EDGE_VOICES = [
@@ -311,6 +311,33 @@ class MainWindow(QMainWindow):
         self.text_edit = QTextEdit(); self.text_edit.setPlaceholderText("Enter text to read.")
         self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         layout.addWidget(self.text_edit)
+
+        # --- NEW: Inline Search Bar ---
+        self.search_widget = QWidget()
+        search_layout = QHBoxLayout(self.search_widget)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Find...")
+        self.search_next_btn = QPushButton("↓ Next")
+        self.search_prev_btn = QPushButton("↑ Prev")
+        self.search_close_btn = QPushButton("✖")
+        self.search_close_btn.setFixedSize(24, 24)
+        
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.search_prev_btn)
+        search_layout.addWidget(self.search_next_btn)
+        search_layout.addWidget(self.search_close_btn)
+        
+        layout.addWidget(self.search_widget)
+        self.search_widget.setVisible(False) # Hidden by default
+        
+        # Connect search signals
+        self.search_input.returnPressed.connect(self.find_next)
+        self.search_next_btn.clicked.connect(self.find_next)
+        self.search_prev_btn.clicked.connect(self.find_prev)
+        self.search_close_btn.clicked.connect(self.hide_search_bar)
+        self.search_input.textChanged.connect(self.find_next) # Search as you type
         
         button_layout = QHBoxLayout()
         self.prev_button = QPushButton("⏮ Prev"); self.play_button = QPushButton("▶ Play")
@@ -335,7 +362,17 @@ class MainWindow(QMainWindow):
         self.update_eta()
         self.text_edit.installEventFilter(self)
 
+        self.find_action = QAction(self)
+        self.find_action.setShortcut(QKeySequence("Ctrl+F"))
+        self.find_action.triggered.connect(self.show_search_bar)
+        self.addAction(self.find_action)
+
     def eventFilter(self, source, event):
+        if event.type() == event.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
+            if self.search_widget.isVisible():
+                self.hide_search_bar()
+                return True
+
         if source == self.text_edit and event.type() == event.Type.KeyPress:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
                 self.toggle_playback(); return True 
@@ -670,6 +707,45 @@ class MainWindow(QMainWindow):
         
     def show_error(self, message): QMessageBox.critical(self, "Error", message); self.full_stop()
     def closeEvent(self, event): self.save_settings(); self.full_stop(); event.accept()
+
+    # --- NEW: Find Feature Methods ---
+    def show_search_bar(self):
+        self.search_widget.setVisible(True)
+        self.search_input.setFocus()
+        self.search_input.selectAll()
+
+    def hide_search_bar(self):
+        self.search_widget.setVisible(False)
+        self.text_edit.setFocus()
+
+    def find_next(self):
+        text = self.search_input.text()
+        if not text: return
+        
+        # Standard forward search
+        found = self.text_edit.find(text)
+        
+        # If it reaches the bottom, wrap around to the top
+        if not found:
+            cursor = self.text_edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            self.text_edit.setTextCursor(cursor)
+            self.text_edit.find(text)
+
+    def find_prev(self):
+        text = self.search_input.text()
+        if not text: return
+        
+        # Search backwards
+        options = QTextDocument.FindFlag.FindBackward
+        found = self.text_edit.find(text, options)
+        
+        # If it reaches the top, wrap around to the bottom
+        if not found:
+            cursor = self.text_edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.text_edit.setTextCursor(cursor)
+            self.text_edit.find(text, options)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
