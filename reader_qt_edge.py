@@ -8,6 +8,8 @@ import io
 import hashlib
 import glob
 import logging
+import json
+import re
 
 # Configure the global logging format
 logging.basicConfig(
@@ -15,13 +17,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s'
 )
 
-import json
-import re  # NEW: Required for precise word highlighting
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QTextEdit, QPushButton, QComboBox, QHBoxLayout,
                              QFileDialog, QMessageBox, QLabel, QSlider, QDialog,
                              QFormLayout, QFontComboBox, QSpinBox, QDialogButtonBox,
-                             QColorDialog, QLineEdit)
+                             QColorDialog, QLineEdit, QTabWidget)
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QTextCursor, QColor, QTextCharFormat, QFont, QAction, QIcon, QTextDocument, QKeySequence
 import edge_tts
@@ -39,23 +39,29 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Appearance Settings")
         self.settings = current_settings.copy()
         layout = QFormLayout(self)
+        
         self.font_combo = QFontComboBox(); self.font_combo.setCurrentFont(QFont(self.settings["font_family"]))
         layout.addRow("Font Family:", self.font_combo)
+        
         self.font_size_spinbox = QSpinBox(); self.font_size_spinbox.setRange(8, 72); self.font_size_spinbox.setValue(self.settings["font_size"])
         layout.addRow("Font Size:", self.font_size_spinbox)
+        
         color_layout = QHBoxLayout()
         self.bg_color_btn = self.create_color_button(self.settings["bg_color"])
         self.text_color_btn = self.create_color_button(self.settings["text_color"])
         self.highlight_color_btn = self.create_color_button(self.settings["highlight_color"])
         self.completed_color_btn = self.create_color_button(self.settings["completed_color"])
+        
         color_layout.addWidget(QLabel("BG:")); color_layout.addWidget(self.bg_color_btn)
         color_layout.addWidget(QLabel("Text:")); color_layout.addWidget(self.text_color_btn)
         color_layout.addWidget(QLabel("Highlight:")); color_layout.addWidget(self.highlight_color_btn)
         color_layout.addWidget(QLabel("Completed:")); color_layout.addWidget(self.completed_color_btn)
         layout.addRow(color_layout)
+        
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(self.accept); button_box.rejected.connect(self.reject)
         layout.addRow(button_box)
+        
         self.bg_color_btn.clicked.connect(lambda: self.pick_color(self.bg_color_btn, "bg_color"))
         self.text_color_btn.clicked.connect(lambda: self.pick_color(self.text_color_btn, "text_color"))
         self.highlight_color_btn.clicked.connect(lambda: self.pick_color(self.highlight_color_btn, "highlight_color"))
@@ -64,13 +70,16 @@ class SettingsDialog(QDialog):
     def create_color_button(self, color):
         btn = QPushButton(); btn.setFixedSize(24, 24); btn.setStyleSheet(f"background-color: {color}; border: 1px solid grey;")
         return btn
+        
     def pick_color(self, btn, key):
         color = QColorDialog.getColor(QColor(self.settings[key]), self)
         if color.isValid(): self.settings[key] = color.name(); btn.setStyleSheet(f"background-color: {color.name()}; border: 1px solid grey;")
+        
     def accept(self):
         self.settings["font_family"] = self.font_combo.currentFont().family()
         self.settings["font_size"] = self.font_size_spinbox.value()
         super().accept()
+        
     def get_settings(self): return self.settings
 
 
@@ -82,22 +91,17 @@ class EdgeSynthWorker(QObject):
         super().__init__()
         self.lines = lines; self.voice = voice; self.audio_queue = audio_queue
         self.speed_rate = speed_rate; self._is_running = True
-        
-        # Initialize a specific logger for this class
         self.logger = logging.getLogger("EdgeSynthCache")
         
-        # Ensure cache directory exists
         self.cache_dir = os.path.expanduser("~/.cache/edge-qt/audio")
         os.makedirs(self.cache_dir, exist_ok=True)
-        self.clean_lru_cache() # Run cleanup on startup
+        self.clean_lru_cache()
         
     def clean_lru_cache(self, max_files=200):
-        """Keep cache from growing infinitely. Deletes oldest files if over limit."""
         try:
             files = glob.glob(os.path.join(self.cache_dir, "*.wav"))
             if len(files) > max_files:
                 self.logger.info(f"LRU Cache limit exceeded ({len(files)} files). Cleaning up...")
-                # Sort by last accessed time (oldest first)
                 files.sort(key=os.path.getatime)
                 for old_wav in files[:-max_files]:
                     os.remove(old_wav)
@@ -121,14 +125,12 @@ class EdgeSynthWorker(QObject):
             if not self._is_running: break
             if not line.strip(): continue 
             
-            # 1. Generate unique hash
             hash_string = f"{line.strip()}_{self.voice}_{self.speed_rate}".encode('utf-8')
             hash_id = hashlib.md5(hash_string).hexdigest()
             
             wav_path = os.path.join(self.cache_dir, f"{hash_id}.wav")
             json_path = os.path.join(self.cache_dir, f"{hash_id}.json")
             
-            # 2. CACHE HIT
             if os.path.exists(wav_path) and os.path.exists(json_path):
                 try:
                     data, samplerate = sf.read(wav_path, dtype='float32')
@@ -137,7 +139,6 @@ class EdgeSynthWorker(QObject):
                     
                     self.logger.info(f"Cache HIT  | Line {i}")
                     
-                    # --- FIX: Safe queue insertion with timeout ---
                     item = {'index': i, 'data': data, 'samplerate': samplerate, 'boundaries': boundaries}
                     while self._is_running:
                         try:
@@ -148,7 +149,6 @@ class EdgeSynthWorker(QObject):
                 except Exception as e:
                     self.logger.warning(f"Cache read error: {e}. Falling back to network.")
 
-            # 3. CACHE MISS
             try:
                 self.logger.info(f"Cache MISS | Line {i} | Downloading...")
                 comm = edge_tts.Communicate(line, self.voice, rate=self.speed_rate)
@@ -179,7 +179,6 @@ class EdgeSynthWorker(QObject):
                     sf.write(wav_path, data, samplerate)
                     with open(json_path, 'w') as f: json.dump(boundaries, f)
                             
-                    # --- FIX: Safe queue insertion with timeout ---
                     item = {'index': i, 'data': data, 'samplerate': samplerate, 'boundaries': boundaries}
                     while self._is_running:
                         try:
@@ -199,7 +198,7 @@ class EdgeSynthWorker(QObject):
 class AudioPlaybackWorker(QObject):
     playback_finished = pyqtSignal()
     highlight_line = pyqtSignal(int)
-    highlight_word = pyqtSignal(int, int, str) # NEW: line_index, word_index, word_text
+    highlight_word = pyqtSignal(int, int, str) 
     line_completed = pyqtSignal(int)
     
     def __init__(self, audio_queue, volume, line_index_offset):
@@ -214,7 +213,7 @@ class AudioPlaybackWorker(QObject):
                 if item is None: break
                 
                 local_line_index = item['index']; audio_data = item['data']; samplerate = item['samplerate']
-                boundaries = item.get('boundaries', []) # Get the word boundaries
+                boundaries = item.get('boundaries', []) 
                 
                 if not self._is_running: break
                 
@@ -228,7 +227,7 @@ class AudioPlaybackWorker(QObject):
                     self.stream = sd.OutputStream(samplerate=samplerate, channels=1, dtype='float32')
                     self.stream.start()
                 
-                chunk_size = int(samplerate * 0.05) 
+                chunk_size = int(samplerate * 0.1) 
                 frames_played = 0
                 current_word_idx = 0
                 
@@ -236,9 +235,7 @@ class AudioPlaybackWorker(QObject):
                     if not self._is_running: break
                     chunk = audio_data[i:i + chunk_size]
                     
-                    # --- NEW: Word boundary synchronization ---
                     current_time = frames_played / samplerate
-                    # Peek ahead: if the current 50ms block hits a boundary, emit the signal
                     while current_word_idx < len(boundaries) and current_time >= boundaries[current_word_idx]['time']:
                         self.highlight_word.emit(original_line_index, current_word_idx, boundaries[current_word_idx]['text'])
                         current_word_idx += 1
@@ -272,8 +269,8 @@ class MainWindow(QMainWindow):
         self.lines = []; self.line_word_counts = []; self.words_remaining = 0
         self.last_highlighted_block = None; self.playback_state = "stopped"; self.current_line_index = 0
         
-        self.last_word_cursor = None # Track the currently highlighted word
-        self.current_line_search_pos = 0 # Track position to handle duplicate words natively
+        self.last_word_cursor = None 
+        self.current_line_search_pos = 0 
         
         self.config_path = os.path.expanduser("~/.config/edge-qt/settings.json")
         self.settings = {
@@ -281,21 +278,22 @@ class MainWindow(QMainWindow):
             "bg_color": "#ffffff", "text_color": "#000000",
             "highlight_color": "#a8d8ff", "completed_color": "#808080",
             "voice": "en-US-AriaNeural", "speed": 10, "volume": 100,
-            "session_text": "", "session_cursor_line": 0
+            "sessions": [], "active_session": 0
         }
         self.load_settings()
 
         self.setup_actions(); self.setup_menu(); self.setup_toolbar()
         central_widget = QWidget(); self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
-        controls_layout = QHBoxLayout()
         
+        # --- Controls Layout ---
+        controls_layout = QHBoxLayout()
         controls_layout.addWidget(QLabel("Voice:")); self.voice_combo = QComboBox()
         self.voice_combo.addItems(EDGE_VOICES)
         controls_layout.addWidget(self.voice_combo)
         
         controls_layout.addWidget(QLabel("Speed:")); self.speed_slider = QSlider(Qt.Orientation.Horizontal)
-        self.speed_slider.setRange(5, 30); self.speed_slider.setValue(10)
+        self.speed_slider.setRange(5, 50); self.speed_slider.setValue(10)
         controls_layout.addWidget(self.speed_slider)
         self.speed_label = QLabel("1.0x"); controls_layout.addWidget(self.speed_label)
         
@@ -304,15 +302,19 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.volume_slider)
         self.volume_label = QLabel("100%"); controls_layout.addWidget(self.volume_label)
         
-        self.eta_label = QLabel("Total ETA: 00:00:00")
+        self.eta_label = QLabel("Session ETA: 00:00:00")
         controls_layout.addWidget(self.eta_label)
         layout.addLayout(controls_layout)
         
-        self.text_edit = QTextEdit(); self.text_edit.setPlaceholderText("Enter text to read.")
-        self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        layout.addWidget(self.text_edit)
+        # --- NEW: Multi-Session Tabs ---
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setTabsClosable(True)
+        self.tab_widget.tabCloseRequested.connect(self.close_tab)
+        self.tab_widget.currentChanged.connect(self.on_tab_changed)
+        layout.addWidget(self.tab_widget)
+        self.text_edit = None # Dynamically bound to active tab
 
-        # --- NEW: Inline Search Bar ---
+        # --- Search Bar ---
         self.search_widget = QWidget()
         search_layout = QHBoxLayout(self.search_widget)
         search_layout.setContentsMargins(0, 0, 0, 0)
@@ -330,15 +332,15 @@ class MainWindow(QMainWindow):
         search_layout.addWidget(self.search_close_btn)
         
         layout.addWidget(self.search_widget)
-        self.search_widget.setVisible(False) # Hidden by default
+        self.search_widget.setVisible(False) 
         
-        # Connect search signals
         self.search_input.returnPressed.connect(self.find_next)
         self.search_next_btn.clicked.connect(self.find_next)
         self.search_prev_btn.clicked.connect(self.find_prev)
         self.search_close_btn.clicked.connect(self.hide_search_bar)
-        self.search_input.textChanged.connect(self.find_next) # Search as you type
+        self.search_input.textChanged.connect(self.find_next) 
         
+        # --- Playback Buttons ---
         button_layout = QHBoxLayout()
         self.prev_button = QPushButton("⏮ Prev"); self.play_button = QPushButton("▶ Play")
         self.stop_button = QPushButton("⏹ Stop"); self.next_button = QPushButton("⏭ Next")
@@ -354,18 +356,57 @@ class MainWindow(QMainWindow):
         
         self.speed_slider.valueChanged.connect(self.update_speed_label)
         self.volume_slider.valueChanged.connect(self.update_volume_label)
-        self.text_edit.textChanged.connect(self.update_eta)
         self.speed_slider.valueChanged.connect(self.update_eta)
         
-        self.apply_settings()
-        self.restore_session()
-        self.update_eta()
-        self.text_edit.installEventFilter(self)
-
         self.find_action = QAction(self)
         self.find_action.setShortcut(QKeySequence("Ctrl+F"))
         self.find_action.triggered.connect(self.show_search_bar)
         self.addAction(self.find_action)
+        
+        self.restore_session()
+        self.apply_settings()
+
+    # --- NEW: Tab Management Methods ---
+    def add_tab(self, title="New Session", text="", cursor_line=0):
+        text_edit = QTextEdit()
+        text_edit.setPlaceholderText("Enter text to read.")
+        text_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        text_edit.setText(text)
+        
+        font = QFont(self.settings["font_family"], self.settings["font_size"])
+        text_edit.setFont(font)
+        text_edit.setStyleSheet(f"background-color: {self.settings['bg_color']}; color: {self.settings['text_color']};")
+        
+        text_edit.installEventFilter(self)
+        text_edit.textChanged.connect(self.update_eta)
+        text_edit.cursorPositionChanged.connect(self.update_eta)
+        
+        block = text_edit.document().findBlockByNumber(cursor_line)
+        if block.isValid():
+            cursor = QTextCursor(block)
+            text_edit.setTextCursor(cursor)
+            
+        index = self.tab_widget.addTab(text_edit, title)
+        self.tab_widget.setCurrentIndex(index)
+        self.text_edit = text_edit
+        return text_edit
+
+    def on_tab_changed(self, index):
+        if index == -1: return
+        if self.playback_state != "stopped": 
+            self.full_stop()
+        self.text_edit = self.tab_widget.widget(index)
+        self.update_eta()
+
+    def close_tab(self, index):
+        if self.tab_widget.count() > 1:
+            if self.tab_widget.currentIndex() == index and self.playback_state != "stopped":
+                self.full_stop()
+            self.tab_widget.removeTab(index)
+        else:
+            self.full_stop()
+            self.text_edit.clear()
+            self.tab_widget.setTabText(0, "New Session")
 
     def eventFilter(self, source, event):
         if event.type() == event.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
@@ -373,6 +414,7 @@ class MainWindow(QMainWindow):
                 self.hide_search_bar()
                 return True
 
+        # Ensure filter dynamically targets the active tab
         if source == self.text_edit and event.type() == event.Type.KeyPress:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
                 self.toggle_playback(); return True 
@@ -389,6 +431,7 @@ class MainWindow(QMainWindow):
     def play_next(self): self.navigate_playback(1)
 
     def navigate_playback(self, offset):
+        if not self.text_edit: return
         full_text = self.text_edit.toPlainText()
         current_lines = [line for line in full_text.splitlines()]
         if not current_lines: return
@@ -415,6 +458,7 @@ class MainWindow(QMainWindow):
         else: self.playback_state = "paused"; self.update_highlight(new_index)
 
     def play_audio(self):
+        if not self.text_edit: return
         if self.playback_state == "stopped":
             cursor = self.text_edit.textCursor()
             self.current_line_index = cursor.blockNumber()
@@ -422,15 +466,12 @@ class MainWindow(QMainWindow):
             self.lines = [line for line in full_text.splitlines()]
             self.line_word_counts = [len(line.split()) for line in self.lines]
             
-            # --- NEW: Look-Ahead Eraser ---
-            # If we start playing, ensure all upcoming text is reset to white (unread).
-            # This prevents old yellow text from remaining if we click backward in the document.
-            reset_cursor = QTextCursor(self.text_edit.document().findBlockByNumber(self.current_line_index))
-            reset_cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
-            fmt = QTextCharFormat()
-            fmt.setForeground(QColor(self.settings["text_color"]))
-            fmt.setBackground(Qt.GlobalColor.transparent)
-            reset_cursor.mergeCharFormat(fmt)
+            # reset_cursor = QTextCursor(self.text_edit.document().findBlockByNumber(self.current_line_index))
+            # reset_cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+            # fmt = QTextCharFormat()
+            # fmt.setForeground(QColor(self.settings["text_color"]))
+            # fmt.setBackground(Qt.GlobalColor.transparent)
+            # reset_cursor.mergeCharFormat(fmt)
             
         lines_to_play = self.lines[self.current_line_index:]
         if not lines_to_play: self.full_stop(); return
@@ -442,7 +483,7 @@ class MainWindow(QMainWindow):
         rate_str = f"{speed_percentage:+d}%"
         volume = self.volume_slider.value() / 100.0
         
-        self.audio_queue = queue.Queue(maxsize=5)
+        self.audio_queue = queue.Queue(maxsize=50)
         self.playback_thread = QThread()
         self.audio_player = AudioPlaybackWorker(self.audio_queue, volume, self.current_line_index)
         self.audio_player.moveToThread(self.playback_thread)
@@ -467,23 +508,20 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(True)
         self.text_edit.setReadOnly(True)
 
-    # --- NEW: Core UI Engine for precise word targeting ---
     def update_word_highlight(self, line_index, word_index, word_text):
-        if self.current_line_index != line_index: return
+        if not self.text_edit or self.current_line_index != line_index: return
 
-        block = self.text_edit.document().findBlockByNumber(line_index)
+        # block = self.text_edit.document().findBlockByNumber(line_index)
+        if not hasattr(self, 'playback_cursor'): return
+        block = self.playback_cursor.block()
         if not block.isValid(): return
         
-        # Reset search tracker if it's the start of a new line
         if word_index == 0:
             self.current_line_search_pos = 0
 
-        # 1. Transform the previous word into the 'completed' state
         if self.last_word_cursor:
             fmt = QTextCharFormat()
-            # Remove the blue background
             fmt.setBackground(Qt.GlobalColor.transparent) 
-            # --- FIX: Set the text to your completed color (Yellow) ---
             fmt.setForeground(QColor(self.settings["completed_color"])) 
             self.last_word_cursor.mergeCharFormat(fmt)
             self.last_word_cursor = None
@@ -492,20 +530,18 @@ class MainWindow(QMainWindow):
         clean_word = word_text.strip(".,!?\"';:()[]{} ")
         if not clean_word: return
         
-        # 2. Progressive Search
         escaped_word = re.escape(clean_word)
         match = re.search(escaped_word, text[self.current_line_search_pos:], re.IGNORECASE)
 
         if match:
             start = self.current_line_search_pos + match.start()
             end = self.current_line_search_pos + match.end()
-            self.current_line_search_pos = end # Save position for next word
+            self.current_line_search_pos = end
 
             cursor = QTextCursor(block)
             cursor.setPosition(block.position() + start)
             cursor.setPosition(block.position() + end, QTextCursor.MoveMode.KeepAnchor)
 
-            # 3. Paint the active word (Blue BG, White Text)
             fmt = QTextCharFormat()
             fmt.setBackground(QColor(self.settings["highlight_color"]))
             fmt.setForeground(QColor(self.settings["text_color"]))
@@ -523,7 +559,6 @@ class MainWindow(QMainWindow):
             temp_cursor.mergeCharFormat(fmt)
             self.last_highlighted_block = None 
             
-            # Ensure the last word highlight dies with the line
             if hasattr(self, 'last_word_cursor') and self.last_word_cursor:
                 self.last_word_cursor.setCharFormat(fmt)
                 self.last_word_cursor = None
@@ -534,17 +569,24 @@ class MainWindow(QMainWindow):
         self.update_eta()
 
     def update_highlight(self, line_index):
+        if not self.text_edit: return
         self.clear_highlight()
         self.current_line_index = line_index
         
-        if self.playback_cursor.blockNumber() != line_index:
+        if hasattr(self, 'playback_cursor'):
+            current_block_num = self.playback_cursor.blockNumber()
+            if current_block_num < line_index:
+                for _ in range(line_index - current_block_num):
+                    self.playback_cursor.movePosition(QTextCursor.MoveOperation.NextBlock)
+            elif current_block_num > line_index:
+                self.playback_cursor = QTextCursor(self.text_edit.document().findBlockByNumber(line_index))
+        else:
             self.playback_cursor = QTextCursor(self.text_edit.document().findBlockByNumber(line_index))
-            
+
         block = self.playback_cursor.block()
         if block.isValid():
-            self.last_highlighted_block = block # Save for completion coloring later
+            self.last_highlighted_block = block
             
-            # --- Auto-Scroll Logic (No background coloring here anymore) ---
             cursor_rect = self.text_edit.cursorRect(self.playback_cursor)
             viewport_height = self.text_edit.viewport().height()
             
@@ -556,13 +598,13 @@ class MainWindow(QMainWindow):
         self.update_eta()
         
     def clear_highlight(self, force_clear_all=False):
+        if not self.text_edit: return
         clear_format = QTextCharFormat()
         clear_format.setBackground(QColor(self.settings["bg_color"]))
         clear_format.setForeground(QColor(self.settings["text_color"]))
         
         current_visible_cursor = self.text_edit.textCursor()
         
-        # Wipe out any orphaned word highlights before clearing the line
         if hasattr(self, 'last_word_cursor') and self.last_word_cursor:
             self.last_word_cursor.mergeCharFormat(clear_format)
             self.last_word_cursor = None
@@ -575,11 +617,23 @@ class MainWindow(QMainWindow):
         self.last_highlighted_block = None
         self.text_edit.setTextCursor(current_visible_cursor)
 
+    # --- NEW: Dynamic Cursor-Aware ETA ---
     def update_eta(self, *args):
+        if not hasattr(self, 'text_edit') or not self.text_edit: return
+        
         if self.playback_state in ["playing", "paused"] and hasattr(self, 'words_remaining'):
-            word_count = max(0, self.words_remaining); prefix = "Time Left: "
+            word_count = max(0, self.words_remaining)
+            prefix = "Time Left: "
         else:
-            text = self.text_edit.toPlainText(); word_count = len(text.split()); prefix = "Total ETA: "
+            # Calculate remaining words based on the active tab's cursor position
+            cursor = self.text_edit.textCursor()
+            current_block = cursor.blockNumber()
+            lines = self.text_edit.toPlainText().splitlines()
+            if current_block < len(lines):
+                word_count = sum(len(line.split()) for line in lines[current_block:])
+            else:
+                word_count = 0
+            prefix = "Session ETA: "
             
         base_wpm = 165.0; speed_multiplier = self.speed_slider.value() / 10.0; adjusted_wpm = base_wpm * speed_multiplier
         if adjusted_wpm > 0 and word_count > 0:
@@ -591,41 +645,95 @@ class MainWindow(QMainWindow):
     def load_settings(self):
         try:
             if os.path.exists(self.config_path):
-                with open(self.config_path, 'r') as f: self.settings.update(json.load(f))
+                with open(self.config_path, 'r') as f:
+                    loaded = json.load(f)
+                    self.settings.update(loaded)
+                    # Legacy fallback handling to cleanly migrate older single-session saves
+                    if "session_text" in loaded and "sessions" not in self.settings:
+                        self.settings["sessions"] = [{
+                            "title": "Session 1",
+                            "text": loaded.get("session_text", ""),
+                            "cursor_line": loaded.get("session_cursor_line", 0)
+                        }]
         except Exception as e: print(f"Could not load settings: {e}")
+
     def save_settings(self):
         try:
-            self.settings["voice"] = self.voice_combo.currentText(); self.settings["speed"] = self.speed_slider.value(); self.settings["volume"] = self.volume_slider.value()
-            self.settings["session_text"] = self.text_edit.toPlainText(); self.settings["session_cursor_line"] = self.text_edit.textCursor().blockNumber()
+            self.settings["voice"] = self.voice_combo.currentText()
+            self.settings["speed"] = self.speed_slider.value()
+            self.settings["volume"] = self.volume_slider.value()
+            
+            sessions = []
+            for i in range(self.tab_widget.count()):
+                widget = self.tab_widget.widget(i)
+                sessions.append({
+                    "title": self.tab_widget.tabText(i),
+                    "text": widget.toPlainText(),
+                    "cursor_line": widget.textCursor().blockNumber()
+                })
+            self.settings["sessions"] = sessions
+            self.settings["active_session"] = self.tab_widget.currentIndex()
+            
+            # Wipe deprecated keys
+            self.settings.pop("session_text", None)
+            self.settings.pop("session_cursor_line", None)
+            
             os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
             with open(self.config_path, 'w') as f: json.dump(self.settings, f, indent=4)
         except Exception as e: print(f"Could not save settings: {e}")
+
     def restore_session(self):
-        if self.settings.get("session_text"):
-            self.text_edit.setText(self.settings["session_text"])
-            cursor_line = self.settings.get("session_cursor_line", 0)
-            block = self.text_edit.document().findBlockByNumber(cursor_line)
-            if block.isValid(): self.text_edit.setTextCursor(QTextCursor(block))
+        sessions = self.settings.get("sessions", [])
+        if not sessions:
+            self.add_tab("New Session", "", 0)
+        else:
+            for s in sessions:
+                self.add_tab(s.get("title", "New Session"), s.get("text", ""), s.get("cursor_line", 0))
+            
+            active_idx = self.settings.get("active_session", 0)
+            if 0 <= active_idx < self.tab_widget.count():
+                self.tab_widget.setCurrentIndex(active_idx)
             
     def setup_actions(self):
-        self.open_action = QAction(QIcon.fromTheme("document-open"), "&Open Text File...", self); self.open_action.triggered.connect(self.open_text_file)
+        self.new_tab_action = QAction(QIcon.fromTheme("document-new"), "&New Session", self); self.new_tab_action.setShortcut(QKeySequence("Ctrl+T")); self.new_tab_action.triggered.connect(lambda: self.add_tab())
+        self.open_action = QAction(QIcon.fromTheme("document-open"), "&Open Text File...", self); self.open_action.setShortcut(QKeySequence("Ctrl+O")); self.open_action.triggered.connect(self.open_text_file)
         self.settings_action = QAction(QIcon.fromTheme("preferences-system"), "&Settings...", self); self.settings_action.triggered.connect(self.open_settings_dialog)
+        
     def setup_menu(self):
-        menu = self.menuBar(); file_menu = menu.addMenu("&File"); file_menu.addAction(self.open_action); edit_menu = menu.addMenu("&Edit"); edit_menu.addAction(self.settings_action)
+        menu = self.menuBar()
+        file_menu = menu.addMenu("&File")
+        file_menu.addAction(self.new_tab_action)
+        file_menu.addAction(self.open_action)
+        edit_menu = menu.addMenu("&Edit")
+        edit_menu.addAction(self.settings_action)
+        
     def setup_toolbar(self):
-        toolbar = self.addToolBar("Main Toolbar"); toolbar.addAction(self.open_action); toolbar.addAction(self.settings_action)
+        toolbar = self.addToolBar("Main Toolbar")
+        toolbar.addAction(self.new_tab_action)
+        toolbar.addAction(self.open_action)
+        toolbar.addAction(self.settings_action)
+        
     def open_text_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open Text File", "", "Text Files (*.txt);;All Files (*)")
         if file_path:
             try:
-                with open(file_path, 'r', encoding='utf-8') as f: self.text_edit.setText(f.read())
+                with open(file_path, 'r', encoding='utf-8') as f: 
+                    text = f.read()
+                title = os.path.basename(file_path)
+                self.add_tab(title, text, 0)
             except Exception as e: self.show_error(f"Failed to open file:\n\n{e}")
+            
     def open_settings_dialog(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec(): self.settings = dialog.get_settings(); self.apply_settings(); self.save_settings()
+        
     def apply_settings(self):
         font = QFont(self.settings["font_family"], self.settings["font_size"])
-        self.text_edit.setFont(font); self.text_edit.setStyleSheet(f"background-color: {self.settings['bg_color']}; color: {self.settings['text_color']};")
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            widget.setFont(font)
+            widget.setStyleSheet(f"background-color: {self.settings['bg_color']}; color: {self.settings['text_color']};")
+            
         if self.settings["voice"]: self.voice_combo.setCurrentText(self.settings["voice"])
         self.speed_slider.setValue(self.settings["speed"]); self.volume_slider.setValue(self.settings["volume"])
         
@@ -634,17 +742,18 @@ class MainWindow(QMainWindow):
     def toggle_playback(self):
         if self.playback_state == "playing": self.pause_audio()
         else: self.play_audio()
+        
     def pause_audio(self):
         self.playback_state = "paused"; self.play_button.setText("▶ Resume")
         self.stop_threads(reset_highlight=False)
+        
     def full_stop(self):
+        if not self.text_edit: return
         self.playback_state = "stopped"
         self.play_button.setText("▶ Play")
         
-        # 1. Stop threads safely WITHOUT wiping the entire document's formatting
         self.stop_threads(reset_highlight=False)
         
-        # 2. Lock in the 'completed' yellow color for the exact word we stopped on
         fmt = QTextCharFormat()
         fmt.setBackground(Qt.GlobalColor.transparent)
         fmt.setForeground(QColor(self.settings["completed_color"]))
@@ -653,7 +762,6 @@ class MainWindow(QMainWindow):
             self.last_word_cursor.mergeCharFormat(fmt)
             self.last_word_cursor = None
             
-        # Clear any leftover background highlight from the active block, keeping text yellow
         if hasattr(self, 'last_highlighted_block') and self.last_highlighted_block:
             temp_cursor = QTextCursor(self.last_highlighted_block)
             temp_cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
@@ -662,26 +770,24 @@ class MainWindow(QMainWindow):
             temp_cursor.mergeCharFormat(clear_bg)
             self.last_highlighted_block = None
 
-        # 3. Move the physical UI cursor exactly to the line we stopped at
         cursor = QTextCursor(self.text_edit.document().findBlockByNumber(self.current_line_index))
         self.text_edit.setTextCursor(cursor)
         
         self.lines = []
         self.update_eta()
+        
     def on_playback_finished(self): 
         if self.playback_state == "playing": self.full_stop()
+        
     def stop_threads(self, reset_highlight=False):
-        # 1. Safely signal audio player to stop
         if hasattr(self, 'audio_player') and getattr(self, 'audio_player', None) is not None:
             try: self.audio_player.playback_finished.disconnect(self.on_playback_finished)
             except Exception: pass
             self.audio_player.stop()
             
-        # 2. Safely signal synth worker to stop
         if hasattr(self, 'synth_worker') and getattr(self, 'synth_worker', None) is not None:
             self.synth_worker.stop()
             
-        # 3. Wait for audio thread to close
         if hasattr(self, 'playback_thread') and getattr(self, 'playback_thread', None) is not None:
             self.playback_thread.quit()
             self.playback_thread.wait()
@@ -691,7 +797,6 @@ class MainWindow(QMainWindow):
             self.playback_thread.deleteLater()
             del self.playback_thread
             
-        # 4. Wait for synth thread to close
         if hasattr(self, 'synth_thread') and getattr(self, 'synth_thread', None) is not None:
             self.synth_thread.quit()
             self.synth_thread.wait()
@@ -702,13 +807,12 @@ class MainWindow(QMainWindow):
             del self.synth_thread
             
         if reset_highlight: self.clear_highlight(force_clear_all=True)
-        self.text_edit.setReadOnly(False)
+        if self.text_edit: self.text_edit.setReadOnly(False)
         self.stop_button.setEnabled(False)
         
     def show_error(self, message): QMessageBox.critical(self, "Error", message); self.full_stop()
     def closeEvent(self, event): self.save_settings(); self.full_stop(); event.accept()
 
-    # --- NEW: Find Feature Methods ---
     def show_search_bar(self):
         self.search_widget.setVisible(True)
         self.search_input.setFocus()
@@ -716,16 +820,15 @@ class MainWindow(QMainWindow):
 
     def hide_search_bar(self):
         self.search_widget.setVisible(False)
-        self.text_edit.setFocus()
+        if self.text_edit: self.text_edit.setFocus()
 
     def find_next(self):
+        if not self.text_edit: return
         text = self.search_input.text()
         if not text: return
         
-        # Standard forward search
         found = self.text_edit.find(text)
         
-        # If it reaches the bottom, wrap around to the top
         if not found:
             cursor = self.text_edit.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.Start)
@@ -733,14 +836,13 @@ class MainWindow(QMainWindow):
             self.text_edit.find(text)
 
     def find_prev(self):
+        if not self.text_edit: return
         text = self.search_input.text()
         if not text: return
         
-        # Search backwards
         options = QTextDocument.FindFlag.FindBackward
         found = self.text_edit.find(text, options)
         
-        # If it reaches the top, wrap around to the bottom
         if not found:
             cursor = self.text_edit.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.End)
